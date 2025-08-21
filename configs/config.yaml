@@ -1,0 +1,39 @@
+project_name: nexus_demo
+primary_key: id
+
+target:
+  target_table: table_a.csv
+  target_column: label
+
+architecture:
+  refinement_iterations: 2
+  global_embed_dim: 64
+
+datasets:
+  - name: table_a.csv
+    transformer_type: standard
+    complexity: small
+    context_weight: 1.0
+  - name: table_b.csv
+    transformer_type: standard
+    complexity: small
+    context_weight: 1.0
+
+training:
+  use_synthetic: true
+  synthetic:
+    n_samples: 256
+    feature_dim: 5
+  batch_size: 16
+  epochs: 2
+  optimizer:
+    name: adam
+    lr: 1e-3
+  split_config:
+    test_size: 0.15
+    validation_size: 0.15
+    randomize: true
+
+mlops:
+  logging_provider: stdout
+  experiment_name: nexus_demo_run
