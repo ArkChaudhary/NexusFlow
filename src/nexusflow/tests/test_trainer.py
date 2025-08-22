@@ -6,9 +6,9 @@ def make_dummy_config():
     return ConfigModel(
         project_name="demo",
         primary_key="id",
-        target={"target_table": "a.csv", "target_column": "label"},
+        target={"target_table": "table_a.csv", "target_column": "label"},
         architecture={"global_embed_dim": 8, "refinement_iterations": 1},
-        datasets=[{"name": "a.csv"}, {"name": "b.csv"}],
+        datasets=[{"name": "table_a.csv"}, {"name": "table_b.csv"}],
         training={"batch_size": 4, "epochs": 1, "optimizer": {"lr": 1e-3}},
         mlops={"logging_provider": "stdout"}
     )
