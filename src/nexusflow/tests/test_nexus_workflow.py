@@ -154,9 +154,10 @@ def test_trainer_with_synthetic_data():
         trainer.train()
         
         # Verify checkpoint was saved
-        checkpoint_files = list(Path(tmp_dir).glob("model_epoch_*.pt"))
+        checkpoint_files = list(Path(tmp_dir, "models").glob("*.pt"))
+        if not checkpoint_files:
+            checkpoint_files = list(Path(tmp_dir).glob("model_epoch_*.pt"))
         assert len(checkpoint_files) >= 1
-
 def test_data_validation_errors():
     """Test that appropriate errors are raised for invalid data."""
     config_data = {

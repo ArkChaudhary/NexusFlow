@@ -1,5 +1,5 @@
 """Configuration loader and Pydantic schema for NexusFlow."""
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from typing import List, Dict, Any, Optional
 import yaml
 from loguru import logger
@@ -21,10 +21,15 @@ class TrainingConfig(BaseModel):
     epochs: int = 10
     optimizer: Dict[str, Any] = Field(default_factory=lambda: {'name': 'adam', 'lr': 1e-3})
     split_config: Dict[str, Any] = Field(default_factory=lambda: {'test_size': 0.15, 'validation_size': 0.15, 'randomize': True})
-    
-    # Add synthetic data support
+
     use_synthetic: bool = Field(default=False, description="Whether to use synthetic data instead of real data")
-    synthetic: Optional[SyntheticDataConfig] = Field(default=None, description="Synthetic data generation settings")
+    synthetic: SyntheticDataConfig | None = Field(default=None, description="Synthetic data generation settings")
+
+    @model_validator(mode='after')
+    def _ensure_synthetic_when_enabled(self):
+        if self.use_synthetic and self.synthetic is None:
+            self.synthetic = SyntheticDataConfig()
+        return self
 
 class MLOpsConfig(BaseModel):
     logging_provider: str = 'stdout'
@@ -35,15 +40,15 @@ class ConfigModel(BaseModel):
     primary_key: str
     target: Dict[str, Any]
     architecture: Dict[str, Any]
-    datasets: List[DatasetConfig]
+    datasets: Optional[List[DatasetConfig]] = None
     training: TrainingConfig = TrainingConfig()
     mlops: MLOpsConfig = MLOpsConfig()
 
-    @field_validator('datasets')
-    def at_least_one_dataset(cls, v):
-        if not v or len(v) < 1:
-            raise ValueError('At least one dataset must be specified')
-        return v
+    @model_validator(mode='after')
+    def _require_data_or_synthetic(self):
+        if not self.training.use_synthetic and not (self.datasets and len(self.datasets) >= 1):
+            raise ValueError('At least one dataset must be specified when use_synthetic is False')
+        return self
 
 def load_config_from_file(path: str) -> ConfigModel:
     if not os.path.exists(path):

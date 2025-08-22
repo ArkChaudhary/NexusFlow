@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import torch
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 
 class NexusFlowDataset(Dataset):
     """
@@ -38,7 +38,7 @@ class NexusFlowDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx) -> Tuple[Union[List[torch.Tensor], torch.Tensor], torch.Tensor]:
         """
         Returns features and target for a single sample.
         
