@@ -202,12 +202,17 @@ class TestCreateMultiTableDataset:
         
         datasets = {'table1.csv': df1, 'table2.csv': df2}
         
-        # Create mock config
+        # Create mock config with ALL required fields
         config_data = {
+            'project_name': 'test_project',  # Added required field
             'primary_key': 'id',
             'target': {
                 'target_table': 'table1.csv',
                 'target_column': 'label'
+            },
+            'architecture': {  # Added required field
+                'global_embed_dim': 64,
+                'refinement_iterations': 2
             },
             'datasets': [
                 {'name': 'table1.csv'},
@@ -227,10 +232,15 @@ class TestCreateMultiTableDataset:
         datasets = {'table1.csv': pd.DataFrame({'id': [1], 'feat': [10]})}
         
         config_data = {
+            'project_name': 'test_project',  # Added required field
             'primary_key': 'id',
             'target': {
                 'target_table': 'missing.csv',
                 'target_column': 'label'
+            },
+            'architecture': {  # Added required field
+                'global_embed_dim': 64,
+                'refinement_iterations': 2
             },
             'datasets': [{'name': 'table1.csv'}]
         }
@@ -245,10 +255,15 @@ class TestCreateMultiTableDataset:
         datasets = {'table1.csv': df}
         
         config_data = {
+            'project_name': 'test_project',  # Added required field
             'primary_key': 'id',
             'target': {
                 'target_table': 'table1.csv',
                 'target_column': 'missing_label'
+            },
+            'architecture': {  # Added required field
+                'global_embed_dim': 64,
+                'refinement_iterations': 2
             },
             'datasets': [{'name': 'table1.csv'}]
         }
@@ -272,7 +287,16 @@ class TestLoadDatasets:
         mock_validate.return_value = True
         
         config_data = {
+            'project_name': 'test_project',  # Added required field
             'primary_key': 'id',
+            'target': {  # Added required field
+                'target_table': 'table1.csv',
+                'target_column': 'label'
+            },
+            'architecture': {  # Added required field
+                'global_embed_dim': 64,
+                'refinement_iterations': 2
+            },
             'datasets': [
                 {'name': 'table1.csv'},
                 {'name': 'table2.csv'}
@@ -294,7 +318,16 @@ class TestLoadDatasets:
         mock_load.side_effect = FileNotFoundError("File not found")
         
         config_data = {
+            'project_name': 'test_project',  # Added required field
             'primary_key': 'id',
+            'target': {  # Added required field
+                'target_table': 'missing.csv',
+                'target_column': 'label'
+            },
+            'architecture': {  # Added required field
+                'global_embed_dim': 64,
+                'refinement_iterations': 2
+            },
             'datasets': [{'name': 'missing.csv'}]
         }
         config = ConfigModel.model_validate(config_data)
@@ -322,10 +355,15 @@ class TestMakeDataLoaders:
         datasets = {'table1.csv': df1, 'table2.csv': df2}
         
         config_data = {
+            'project_name': 'test_project',  # Added required field
             'primary_key': 'id',
             'target': {
                 'target_table': 'table1.csv',
                 'target_column': 'label'
+            },
+            'architecture': {  # Added required field
+                'global_embed_dim': 64,
+                'refinement_iterations': 2
             },
             'datasets': [
                 {'name': 'table1.csv'},

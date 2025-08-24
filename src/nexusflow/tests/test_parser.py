@@ -86,9 +86,10 @@ class TestConfigModel:
         """Test that invalid architecture values are handled properly."""
         invalid_config = {
             'project_name': 'test',
-            'primary_key': 'id', 
+            'primary_key': 'id',
             'target': {'target_table': 'table_a.csv', 'target_column': 'label'},
-            'architecture': {'global_embed_dim': -1}  # Invalid negative value
+            'architecture': {'global_embed_dim': -1},  # Invalid negative value
+            'datasets': [{'name': 'table_a.csv'}]  # Added required datasets
         }
         
         # This should still validate as architecture is just a dict
