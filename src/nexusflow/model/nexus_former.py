@@ -50,9 +50,14 @@ class NexusFormer(nn.Module):
                     f"All inputs must share the same batch size; "
                     f"mismatch at input {idx}: {x.size(0)} vs {batch}."
                 )
-            reps.append(enc(x))
+            
+            encoded = enc(x)
+            reps.append(encoded)
+            logger.debug(f"Encoder {idx} output: shape={encoded.shape} mean={encoded.mean().item():.4f} max={encoded.max().item():.4f}")
+        
         concat = torch.cat(reps, dim=-1)
-        logger.debug(f"NexusFormer concatenated representation shape: {concat.shape}")
+        logger.debug(f"NexusFormer concatenated representation: shape={concat.shape} mean={concat.mean().item():.4f}")
+        
         out = self.fusion(concat)
-        logger.debug(f"NexusFormer output shape: {out.shape}")
+        logger.debug(f"NexusFormer final output: shape={out.shape} mean={out.mean().item():.4f} std={out.std().item():.4f}")
         return out.squeeze(-1)

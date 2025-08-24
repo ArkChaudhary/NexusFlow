@@ -80,8 +80,14 @@ class Trainer:
                 self.cfg.primary_key,
                 self.cfg.target['target_column']
             )
-            logger.info(f"Loaded and aligned {len(self.datasets)} datasets")
-            logger.info(f"Input dimensions per dataset: {self.input_dims}")
+            
+            # Enhanced logging: dataset summary after alignment
+            total_samples = len(list(self.datasets.values())[0]) if self.datasets else 0
+            logger.info(f"Aligned datasets summary:")
+            logger.info(f"  Total samples after alignment: {total_samples}")
+            logger.info(f"  Number of datasets: {len(self.datasets)}")
+            logger.info(f"  Input dimensions per dataset: {self.input_dims}")
+            logger.info(f"  Total features across all datasets: {sum(self.input_dims)}")
 
     def _setup_dataloaders(self):
         """

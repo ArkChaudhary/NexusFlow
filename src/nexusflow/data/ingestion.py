@@ -15,7 +15,20 @@ def load_table(path: str) -> pd.DataFrame:
         logger.error(f"Table not found: {path}")
         raise FileNotFoundError(path)
     df = pd.read_csv(path)
+    
+    # Enhanced logging: rows/cols and missing value summary
+    missing_summary = df.isnull().sum()
+    missing_total = missing_summary.sum()
+    missing_cols = missing_summary[missing_summary > 0]
+    
     logger.info(f"Loaded table: {path} rows={len(df)} cols={len(df.columns)}")
+    logger.info(f"Missing values: total={missing_total} ({missing_total/df.size*100:.1f}%)")
+    
+    if len(missing_cols) > 0:
+        logger.info(f"Missing by column: {missing_cols.to_dict()}")
+    else:
+        logger.debug("No missing values found")
+    
     return df
 
 def validate_primary_key(df: pd.DataFrame, key: str) -> bool:
