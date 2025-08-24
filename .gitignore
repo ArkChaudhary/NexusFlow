@@ -2,6 +2,8 @@
 .venv/
 results/
 models/
+datasets/
+NexusFlow.docx
 
 
 # Byte-compiled / optimized / DLL files
@@ -210,4 +212,3 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-NexusFlow.docx
