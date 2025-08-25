@@ -65,11 +65,12 @@ class StandardTabularEncoder(ContextualEncoder):
 class CrossContextualAttention(nn.Module):
     """Multi-head cross-attention mechanism for communication between encoders."""
     
-    def __init__(self, embed_dim: int = 64, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, embed_dim: int = 64, num_heads: int = 4, dropout: float = 0.1, top_k: int = None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.top_k = top_k  # If None, use all peers
         
         if self.head_dim * num_heads != embed_dim:
             raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
@@ -89,11 +90,24 @@ class CrossContextualAttention(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
         
     def forward(self, query_repr: torch.Tensor, context_reprs: List[torch.Tensor]) -> torch.Tensor:
-        """Perform cross-contextual attention."""
+        """Perform cross-contextual attention with optional top-k peer selection."""
         batch_size = query_repr.size(0)
         
         if not context_reprs:
             return self.layer_norm(query_repr)
+        
+        # Apply top-k selection if specified
+        if self.top_k is not None and len(context_reprs) > self.top_k:
+            # Simple strategy: select top-k based on L2 similarity to query
+            similarities = []
+            for ctx in context_reprs:
+                sim = F.cosine_similarity(query_repr.unsqueeze(1), ctx.unsqueeze(1), dim=-1).mean()
+                similarities.append(sim)
+            
+            _, top_indices = torch.topk(torch.stack(similarities), self.top_k)
+            context_reprs = [context_reprs[i] for i in top_indices.tolist()]
+            
+            logger.debug(f"Selected top-{self.top_k} peers from {len(similarities)} candidates")
         
         # Stack all context representations
         context_stack = torch.stack(context_reprs, dim=1)  # [batch, num_contexts, embed_dim]

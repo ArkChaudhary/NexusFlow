@@ -198,6 +198,87 @@ def validate(
         raise typer.Exit(code=1)
 
 @app.command()
+def predict(
+    model_path: Path = typer.Option(..., "--model", "-m", help="Path to .nxf model file"),
+    data_dir: Path = typer.Option("datasets", "--data", "-d", help="Directory containing CSV files"),
+    output_path: Path = typer.Option("predictions.csv", "--output", "-o", help="Output CSV file")
+) -> None:
+    """Make predictions using a trained NexusFlow model."""
+    
+    if not model_path.exists():
+        typer.echo(f"❌ Model file not found: {model_path}", err=True)
+        raise typer.Exit(code=1)
+    
+    if not data_dir.exists():
+        typer.echo(f"❌ Data directory not found: {data_dir}", err=True)
+        raise typer.Exit(code=1)
+    
+    try:
+        # Load model
+        from nexusflow.api.model_api import load_model
+        model = load_model(str(model_path))
+        
+        typer.echo(f"✅ Model loaded: {model_path}")
+        typer.echo(f"   Architecture: {model.get_params()['model_class']}")
+        typer.echo(f"   Input dimensions: {model.get_params()['input_dimensions']}")
+        
+        # Load data
+        import pandas as pd
+        datasets = {}
+        dataset_names = model.get_params()['datasets_info']['dataset_names']
+        
+        for name in dataset_names:
+            file_path = data_dir / name
+            if not file_path.exists():
+                typer.echo(f"❌ Required dataset not found: {file_path}", err=True)
+                raise typer.Exit(code=2)
+            datasets[name] = pd.read_csv(file_path)
+        
+        typer.echo(f"✅ Loaded {len(datasets)} datasets")
+        
+        # Make predictions
+        predictions = model.predict(datasets)
+        
+        # Save predictions
+        output_df = pd.DataFrame({'predictions': predictions})
+        output_df.to_csv(output_path, index=False)
+        
+        typer.echo(f"✅ Predictions saved to: {output_path}")
+        typer.echo(f"   {len(predictions)} predictions generated")
+        
+    except Exception as e:
+        typer.echo(f"❌ Prediction failed: {e}", err=True)
+        raise typer.Exit(code=3)
+
+@app.command() 
+def evaluate(
+    model_path: Path = typer.Option(..., "--model", "-m", help="Path to .nxf model file"),
+    data_dir: Path = typer.Option("datasets", "--data", "-d", help="Directory containing CSV files with ground truth")
+) -> None:
+    """Evaluate a trained model on test data."""
+    
+    if not model_path.exists():
+        typer.echo(f"❌ Model file not found: {model_path}", err=True)
+        raise typer.Exit(code=1)
+    
+    try:
+        from nexusflow.api.model_api import load_model
+        model = load_model(str(model_path))
+        
+        # Show stored evaluation metrics if available
+        metrics = model.evaluate()
+        if metrics:
+            typer.echo("📊 Stored Evaluation Metrics:")
+            for metric, value in metrics.items():
+                typer.echo(f"   {metric}: {value}")
+        else:
+            typer.echo("ℹ️  No stored evaluation metrics found")
+            
+    except Exception as e:
+        typer.echo(f"❌ Evaluation failed: {e}", err=True)
+        raise typer.Exit(code=1)
+
+@app.command()
 def info():
     """Show information about NexusFlow."""
     typer.echo("🔗 NexusFlow - Multi-Transformer Framework for Tabular Data")

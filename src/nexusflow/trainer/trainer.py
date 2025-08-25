@@ -169,6 +169,37 @@ class Trainer:
             retention="7 days"
         )
         logger.info(f"File logging enabled: {log_file}")
+    def _log_attention_heatmaps(self, epoch: int):
+        """Log attention patterns for visualization."""
+        viz_dir = self.work_dir / "results" / "visualizations"
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Enable attention logging
+        for cross_attn in self.model.cross_attentions:
+            cross_attn._log_attention = True
+        
+        # Run a few validation batches to collect attention patterns
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(self.val_loader):
+                if i >= 3:  # Only log first few batches
+                    break
+                # ... process batch and collect attention ...
+        
+        # Save attention summaries
+        attention_data = {}
+        for i, cross_attn in enumerate(self.model.cross_attentions):
+            if hasattr(cross_attn, '_attention_history'):
+                attention_data[f'encoder_{i}'] = cross_attn._attention_history
+                cross_attn._attention_history = []  # Reset
+        
+        import json
+        with open(viz_dir / f"attention_epoch_{epoch}.json", 'w') as f:
+            json.dump(attention_data, f, indent=2, default=str)
+        
+        # Disable attention logging
+        for cross_attn in self.model.cross_attentions:
+            cross_attn._log_attention = False
 
     def _setup_data(self):
         """Enhanced data setup with better logging."""

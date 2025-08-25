@@ -3,7 +3,9 @@
 results/
 models/
 datasets/
+nexusflow_demo
 NexusFlow.docx
+.vscode
 
 
 # Byte-compiled / optimized / DLL files
