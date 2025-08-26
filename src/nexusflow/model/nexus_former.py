@@ -90,7 +90,7 @@ class CrossContextualAttention(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
         
     def forward(self, query_repr: torch.Tensor, context_reprs: List[torch.Tensor]) -> torch.Tensor:
-        """Perform cross-contextual attention with optional top-k peer selection."""
+        """Perform cross-contextual attention with logging."""
         batch_size = query_repr.size(0)
         
         if not context_reprs:
@@ -108,6 +108,18 @@ class CrossContextualAttention(nn.Module):
             context_reprs = [context_reprs[i] for i in top_indices.tolist()]
             
             logger.debug(f"Selected top-{self.top_k} peers from {len(similarities)} candidates")
+        
+        if hasattr(self, '_log_attention') and self._log_attention:
+            # Store attention weights for later analysis
+            attention_summary = {
+                'mean_attention': attention_weights.mean(dim=(0, 1)).cpu().numpy(),
+                'max_attention': attention_weights.max(dim=-1)[0].mean(dim=(0, 1)).cpu().numpy(),
+                'attention_entropy': -torch.sum(attention_weights * torch.log(attention_weights + 1e-8), dim=-1).mean(dim=(0, 1)).cpu().numpy()
+            }
+            
+            if not hasattr(self, '_attention_history'):
+                self._attention_history = []
+            self._attention_history.append(attention_summary)
         
         # Stack all context representations
         context_stack = torch.stack(context_reprs, dim=1)  # [batch, num_contexts, embed_dim]
