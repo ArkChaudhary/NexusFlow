@@ -1,7 +1,0 @@
-{
-    "python.testing.pytestArgs": [
-        "src\nexusflow\tests"
-    ],
-    "python.testing.unittestEnabled": false,
-    "python.testing.pytestEnabled": true
-}
