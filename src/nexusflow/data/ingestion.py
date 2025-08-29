@@ -163,7 +163,7 @@ def get_feature_dimensions(datasets: Dict[str, pd.DataFrame], primary_key: str, 
     
     return dimensions
 
-def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame], cfg: ConfigModel) -> NexusFlowDataset:
+def original_create_multi_table_dataset(datasets: Dict[str, pd.DataFrame], cfg: ConfigModel) -> NexusFlowDataset:
     """
     Create a NexusFlowDataset that handles multiple aligned tables.
     
@@ -223,21 +223,60 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame], cfg: ConfigMod
     
     return dataset
 
-def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame]) -> Tuple[DataLoader, DataLoader, DataLoader]:
+def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame], cfg) -> NexusFlowDataset:
     """
-    Create train/val/test DataLoaders from aligned datasets.
+    Enhanced version that handles different transformer types per dataset.
     
-    Args:
-        cfg: Configuration object
-        datasets: Dict of aligned DataFrames
+    This function extends the original to support:
+    - Different preprocessing per transformer type
+    - Feature scaling optimization for TabNet
+    - Token-level preprocessing for FT-Transformer
+    """
+    # Get the base dataset
+    dataset = original_create_multi_table_dataset(datasets, cfg)
+    
+    # Add transformer-type specific metadata
+    dataset.transformer_types = [d.transformer_type for d in cfg.datasets]
+    dataset.complexities = [d.complexity for d in cfg.datasets]
+    dataset.context_weights = [d.context_weight for d in cfg.datasets]
+    
+    # Preprocess data based on transformer types
+    if hasattr(dataset, 'df'):
+        enhanced_df = dataset.df.copy()
         
-    Returns:
-        Tuple of (train_loader, val_loader, test_loader)
-    """
-    # Split the data
-    # Use the first dataset as reference for splitting (all should have same rows after alignment)
-    reference_df = list(datasets.values())[0]
+        # Apply transformer-specific preprocessing
+        current_idx = 0
+        for i, dataset_config in enumerate(cfg.datasets):
+            transformer_type = dataset_config.transformer_type
+            feature_count = dataset.feature_dimensions[i] if dataset.feature_dimensions else 0
+            
+            if feature_count > 0:
+                feature_cols = enhanced_df.columns[current_idx:current_idx + feature_count]
+                
+                if transformer_type == 'tabnet':
+                    # TabNet benefits from feature normalization
+                    enhanced_df[feature_cols] = (enhanced_df[feature_cols] - enhanced_df[feature_cols].mean()) / (enhanced_df[feature_cols].std() + 1e-8)
+                    logger.debug(f"Applied normalization for TabNet features: {list(feature_cols)}")
+                
+                elif transformer_type == 'ft_transformer':
+                    # FT-Transformer works well with standardized features
+                    enhanced_df[feature_cols] = (enhanced_df[feature_cols] - enhanced_df[feature_cols].min()) / (enhanced_df[feature_cols].max() - enhanced_df[feature_cols].min() + 1e-8)
+                    logger.debug(f"Applied min-max scaling for FT-Transformer features: {list(feature_cols)}")
+                
+                current_idx += feature_count
+        
+        dataset.df = enhanced_df
     
+    logger.info(f"Enhanced dataset created with transformer types: {dataset.transformer_types}")
+    return dataset
+
+
+def make_dataloaders(cfg, datasets: Dict[str, pd.DataFrame]):
+    """
+    Enhanced dataloaders that use transformer-specific preprocessing.
+    """
+
+    reference_df = list(datasets.values())[0]
     train_indices, val_indices, test_indices = split_df(
         reference_df,
         test_size=cfg.training.split_config.get("test_size", 0.15),
@@ -250,18 +289,18 @@ def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame]) -> Tup
     val_datasets = {name: df.iloc[val_indices.index] for name, df in datasets.items()} if len(val_indices) > 0 else {}
     test_datasets = {name: df.iloc[test_indices.index] for name, df in datasets.items()}
     
-    # Create datasets
+    # Create enhanced datasets
     train_dataset = create_multi_table_dataset(train_datasets, cfg)
     val_dataset = create_multi_table_dataset(val_datasets, cfg) if val_datasets else None
     test_dataset = create_multi_table_dataset(test_datasets, cfg)
     
-    # Create DataLoaders
+    # Create adaptive DataLoaders
     batch_size = cfg.training.batch_size
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    logger.info(f"Created DataLoaders: train={len(train_loader)} val={len(val_loader) if val_loader else 0} test={len(test_loader)} batches")
+    logger.info(f"Created enhanced DataLoaders with transformer-specific preprocessing")
     
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader if val_loader else None, test_loader
