@@ -5,7 +5,7 @@ import torch.nn as nn
 import numpy as np
 
 from nexusflow.model.nexus_former import (
-    ContextualEncoder, StandardTabularEncoder, CrossContextualAttention, NexusFormer
+    ContextualEncoder, StandardTabularEncoder, CrossContextualAttention, NexusFormer, FlashAttention
 )
 
 
@@ -37,7 +37,7 @@ class TestStandardTabularEncoder:
         assert encoder.input_dim == 10
         assert encoder.embed_dim == 64
         assert isinstance(encoder.input_projection, nn.Linear)
-        assert isinstance(encoder.transformer, nn.TransformerEncoder)
+        assert isinstance(encoder.layers, nn.ModuleList)
         assert isinstance(encoder.layer_norm, nn.LayerNorm)
         
         # Check input projection dimensions
@@ -120,7 +120,8 @@ class TestCrossContextualAttention:
     def test_attention_initialization(self):
         """Test CrossContextualAttention initialization."""
         embed_dim, num_heads = 64, 4
-        attention = CrossContextualAttention(embed_dim=embed_dim, num_heads=num_heads)
+        flashattention = CrossContextualAttention(embed_dim=embed_dim, num_heads=num_heads)
+        attention = CrossContextualAttention(embed_dim=embed_dim, num_heads=num_heads, use_flash_attn=False)
         
         assert attention.embed_dim == embed_dim
         assert attention.num_heads == num_heads
@@ -128,6 +129,7 @@ class TestCrossContextualAttention:
         
         # Check linear layers
         assert isinstance(attention.query_proj, nn.Linear)
+        assert isinstance(flashattention.flash_attention, FlashAttention)
         assert isinstance(attention.key_proj, nn.Linear)
         assert isinstance(attention.value_proj, nn.Linear)
         assert isinstance(attention.out_proj, nn.Linear)
