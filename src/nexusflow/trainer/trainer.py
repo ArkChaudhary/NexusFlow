@@ -223,7 +223,7 @@ class Trainer:
             if len(transformer_types) == 1:
                 encoder_type = list(transformer_types)[0]
             else:
-                encoder_type = 'mixed'
+                encoder_type = 'standard'
         else:
             encoder_type = 'standard'
         
