@@ -1,4 +1,4 @@
-"""Enhanced configuration loader with advanced architecture support for NexusFlow."""
+"""Enhanced configuration loader with preprocessing support for NexusFlow Phase 2."""
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from typing import List, Dict, Any, Optional, Literal
 import yaml
@@ -10,6 +10,8 @@ class DatasetConfig(BaseModel):
     transformer_type: Literal['standard', 'ft_transformer', 'tabnet', 'text', 'timeseries'] = 'standard'
     complexity: Literal['small', 'medium', 'large'] = 'small'
     context_weight: float = 1.0
+    categorical_columns: Optional[List[str]] = None
+    numerical_columns: Optional[List[str]] = None
 
 class SyntheticDataConfig(BaseModel):
     """Configuration for synthetic data generation."""
@@ -36,6 +38,10 @@ class TrainingConfig(BaseModel):
     early_stopping: bool = Field(default=False, description="Enable early stopping")
     patience: int = Field(default=5, description="Early stopping patience")
     gradient_clipping: float = Field(default=1.0, description="Gradient clipping threshold")
+    
+    # Preprocessing features
+    use_advanced_preprocessing: bool = Field(default=True, description="Enable advanced preprocessing pipeline")
+    auto_detect_types: bool = Field(default=True, description="Auto-detect categorical/numerical columns")
 
     @model_validator(mode='after')
     def _ensure_synthetic_when_enabled(self):
@@ -84,9 +90,21 @@ class ConfigModel(BaseModel):
                     raise ValueError(f"Invalid transformer_type: {dataset.transformer_type}. "
                                    f"Must be one of {valid_types}")
         return self
+    
+    @model_validator(mode='after')
+    def _validate_preprocessing_config(self):
+        """Validate preprocessing configuration."""
+        if self.datasets and self.training.use_advanced_preprocessing:
+            for dataset in self.datasets:
+                # If manual column specification is provided, validate it
+                if dataset.categorical_columns is not None and dataset.numerical_columns is not None:
+                    overlap = set(dataset.categorical_columns) & set(dataset.numerical_columns)
+                    if overlap:
+                        raise ValueError(f"Columns cannot be both categorical and numerical: {overlap}")
+        return self
 
 def load_config_from_file(path: str) -> ConfigModel:
-    """Load and validate configuration from YAML file."""
+    """Load and validate configuration from YAML file with preprocessing support."""
     if not os.path.exists(path):
         logger.error(f"Config file not found: {path}")
         raise FileNotFoundError(path)
@@ -100,7 +118,7 @@ def load_config_from_file(path: str) -> ConfigModel:
         logger.error("Configuration validation failed: {}".format(e))
         raise
     
-    # Enhanced logging with new features
+    # Enhanced logging with preprocessing features
     advanced_features = []
     if cfg.advanced.use_moe:
         advanced_features.append(f"MoE({cfg.advanced.num_experts} experts)")
@@ -108,6 +126,8 @@ def load_config_from_file(path: str) -> ConfigModel:
         advanced_features.append("FlashAttention")
     if cfg.advanced.top_k_contexts:
         advanced_features.append(f"TopK({cfg.advanced.top_k_contexts})")
+    if cfg.training.use_advanced_preprocessing:
+        advanced_features.append("Advanced Preprocessing")
     
     features_str = ", ".join(advanced_features) if advanced_features else "None"
     
@@ -118,5 +138,15 @@ def load_config_from_file(path: str) -> ConfigModel:
     logger.info(f"  Transformer types: {set(dataset_types)}")
     logger.info(f"  Advanced features: {features_str}")
     logger.info(f"  MLOps provider: {cfg.mlops.logging_provider}")
+    
+    # Log preprocessing configuration
+    if cfg.datasets and cfg.training.use_advanced_preprocessing:
+        logger.info("  Preprocessing configuration:")
+        for dataset in cfg.datasets:
+            if dataset.categorical_columns or dataset.numerical_columns:
+                logger.info(f"    {dataset.name}: categorical={len(dataset.categorical_columns or [])}, "
+                           f"numerical={len(dataset.numerical_columns or [])}")
+            else:
+                logger.info(f"    {dataset.name}: auto-detect columns")
     
     return cfg
