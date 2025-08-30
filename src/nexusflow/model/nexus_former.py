@@ -213,7 +213,7 @@ class FTTransformerEncoder(nn.Module):
         cls_output = tokens[:, 0, :]  # [batch, embed_dim]
         output = self.final_norm(cls_output)
         
-        logger.debug(f"FTTransformerEncoder output: shape={output.shape}")
+        #logger.debug(f"FTTransformerEncoder output: shape={output.shape}")
         return output
 
 class TabNetEncoder(nn.Module):
@@ -282,7 +282,7 @@ class TabNetEncoder(nn.Module):
         # Final projection
         output = self.final_projection(decision_out)
         
-        logger.debug(f"TabNetEncoder output: shape={output.shape}")
+        #logger.debug(f"TabNetEncoder output: shape={output.shape}")
         return output
 
 class ContextualEncoder(nn.Module):
@@ -378,7 +378,7 @@ class StandardTabularEncoder(ContextualEncoder):
         x = x.squeeze(1)  # [batch, embed_dim]
         x = self.layer_norm(x)
         
-        logger.debug(f"StandardTabularEncoder output: shape={x.shape} mean={x.mean().item():.4f}")
+        #logger.debug(f"StandardTabularEncoder output: shape={x.shape} mean={x.mean().item():.4f}")
         return x
 
 class CrossContextualAttention(nn.Module):
@@ -436,7 +436,7 @@ class CrossContextualAttention(nn.Module):
             _, top_indices = torch.topk(torch.stack(similarities), self.top_k)
             context_reprs = [context_reprs[i] for i in top_indices.tolist()]
             
-            logger.debug(f"Selected top-{self.top_k} contexts from {len(similarities)} candidates")
+            #logger.debug(f"Selected top-{self.top_k} contexts from {len(similarities)} candidates")
         
         # Stack contexts for efficient processing
         context_stack = torch.stack(context_reprs, dim=1)  # [batch, num_contexts, embed_dim]
@@ -481,7 +481,7 @@ class CrossContextualAttention(nn.Module):
         # Residual connection and layer norm
         output = self.layer_norm(query_repr + output)
         
-        logger.debug(f"CrossContextualAttention output: shape={output.shape}")
+        #logger.debug(f"CrossContextualAttention output: shape={output.shape}")
         return output
 
 class NexusFormer(nn.Module):
@@ -572,11 +572,11 @@ class NexusFormer(nn.Module):
         for i, (encoder, x) in enumerate(zip(self.encoders, inputs)):
             initial_repr = encoder(x)
             representations.append(initial_repr)
-            logger.debug(f"Initial encoding {i}: shape={initial_repr.shape} mean={initial_repr.mean():.4f}")
+            #logger.debug(f"Initial encoding {i}: shape={initial_repr.shape} mean={initial_repr.mean():.4f}")
         
         # Iterative refinement loop with convergence tracking
         for iteration in range(self.refinement_iterations):
-            logger.debug(f"Refinement iteration {iteration + 1}/{self.refinement_iterations}")
+            #logger.debug(f"Refinement iteration {iteration + 1}/{self.refinement_iterations}")
             
             new_representations = []
             total_change = 0.0
@@ -593,14 +593,14 @@ class NexusFormer(nn.Module):
                 # Track convergence
                 change = torch.norm(updated_repr - representations[i], p=2, dim=-1).mean()
                 total_change += change.item()
-                logger.debug(f"Encoder {i} refinement change: {change.item():.6f}")
+                #logger.debug(f"Encoder {i} refinement change: {change.item():.6f}")
             
             representations = new_representations
             
             # Early stopping if convergence achieved
             avg_change = total_change / self.num_encoders
             if avg_change < 1e-6:
-                logger.debug(f"Convergence achieved at iteration {iteration + 1}")
+                #logger.debug(f"Convergence achieved at iteration {iteration + 1}")
                 break
         
         # Adaptive fusion using attention pooling
@@ -624,6 +624,6 @@ class NexusFormer(nn.Module):
         # Final prediction
         output = self.prediction_head(final_repr).squeeze(-1)  # [batch]
         
-        logger.debug(f"NexusFormer final output: shape={output.shape} mean={output.mean():.4f}")
+        #logger.debug(f"NexusFormer final output: shape={output.shape} mean={output.mean():.4f}")
         
         return output
