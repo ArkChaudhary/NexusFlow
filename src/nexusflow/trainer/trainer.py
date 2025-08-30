@@ -266,7 +266,7 @@ class Trainer:
             self.optim = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
         
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optim, mode='min', factor=0.5, patience=3, verbose=True
+            self.optim, mode='min', factor=0.5, patience=3
         )
 
     def _setup_file_logging(self):
