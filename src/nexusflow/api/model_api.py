@@ -355,7 +355,7 @@ class ModelAPI:
             raise FileNotFoundError(p)
         
         # Load checkpoint
-        ckpt = torch.load(p, map_location='cpu')
+        ckpt = torch.load(p, map_location='cpu', weights_only=False)
         meta = ckpt.get('meta', {})
         
         # Reconstruct model from metadata
