@@ -183,6 +183,7 @@ class NexusFlowModelArtifact:
         
         return feature_tensors
     
+    # Updated get_params method in NexusFlowModelArtifact class
     def get_params(self) -> Dict[str, Any]:
         """
         Get model parameters and configuration.
@@ -213,6 +214,10 @@ class NexusFlowModelArtifact:
                 'dataset_names': [d['name'] for d in self.datasets_config] if self.datasets_config else []
             }
         }
+        
+        # Add optimization info if model was optimized
+        if 'optimization' in self.meta:
+            params['optimization'] = self.meta['optimization']
         
         return params
     
@@ -287,8 +292,20 @@ Training Info:
 Data Info:
   - Primary Key: {params['datasets_info']['primary_key']}
   - Target Column: {params['datasets_info']['target_column']}
-  - Datasets: {params['datasets_info']['num_datasets']}
-"""
+  - Datasets: {params['datasets_info']['num_datasets']}"""
+
+        # Add optimization info if available
+        if 'optimization' in params:
+            opt_info = params['optimization']
+            summary += f"""
+
+Optimization Info:
+  - Method: {opt_info['method']}
+  - Size Reduction: {opt_info['size_reduction']:.1%}
+  - Parameter Reduction: {opt_info['parameter_reduction']:.1%}
+  - Original Size: {opt_info['original_size_mb']:.2f} MB
+  - Optimized Size: {opt_info['optimized_size_mb']:.2f} MB"""
+
         return summary.strip()
 
 class ModelAPI:
@@ -309,11 +326,22 @@ class ModelAPI:
         if not p.suffix == '.nxf':
             p = p.with_suffix('.nxf')
         
+        # Check if model has been optimized and update metadata accordingly
+        meta = self.artifact.meta.copy()
+        if 'optimization' in meta:
+            optimization_info = meta['optimization']
+            logger.info(f"Saving optimized model with {optimization_info['method']}")
+            logger.info(f"  Size reduction: {optimization_info['size_reduction']:.1%}")
+            logger.info(f"  Parameter reduction: {optimization_info['parameter_reduction']:.1%}")
+        
         save_data = {
             'model_state': self.artifact.model.state_dict(),
-            'meta': self.artifact.meta,
+            'meta': meta,
             'artifact_version': '1.0'
         }
+        
+        torch.save(save_data, p)
+        logger.info(f"NexusFlow model artifact saved to: {p}")
         
         torch.save(save_data, p)
         logger.info(f"NexusFlow model artifact saved to: {p}")

@@ -8,6 +8,14 @@ from nexusflow.project_manager import ProjectManager
 from nexusflow.config import load_config_from_file
 from nexusflow.trainer.trainer import Trainer
 
+# Import optimization functionality
+try:
+    from nexusflow.optimization.optimizer import optimize_model
+    from nexusflow.api.model_api import load_model, ModelAPI
+    OPTIMIZATION_AVAILABLE = True
+except ImportError:
+    OPTIMIZATION_AVAILABLE = False
+
 app = typer.Typer(help="NexusFlow CLI - Multi-Transformer Framework for Tabular Data")
 
 @app.command()
@@ -31,6 +39,68 @@ def init(
         raise typer.Exit(code=1)
     except Exception as e:
         typer.echo(f"❌ Failed to initialize project: {e}", err=True)
+        raise typer.Exit(code=1)
+
+@app.command()
+def optimize(
+    model_path: Path = typer.Option(..., "--model-path", "-m", help="Path to .nxf model file to optimize"),
+    output_path: Path = typer.Option(..., "--output-path", "-o", help="Path to save optimized .nxf model"),
+    method: str = typer.Option(..., "--method", help="Optimization method: 'quantization' or 'pruning'"),
+    amount: float = typer.Option(0.2, "--amount", help="Pruning amount (0.0-1.0, only for pruning method)")
+) -> None:
+    """Optimize a trained NexusFlow model using post-training techniques."""
+    
+    if not OPTIMIZATION_AVAILABLE:
+        typer.echo("❌ Optimization feature not available. Please ensure torch.quantization is installed.", err=True)
+        raise typer.Exit(code=1)
+    
+    if not model_path.exists():
+        typer.echo(f"❌ Model file not found: {model_path}", err=True)
+        raise typer.Exit(code=1)
+    
+    if method.lower() not in ['quantization', 'pruning']:
+        typer.echo(f"❌ Invalid method: {method}. Use 'quantization' or 'pruning'", err=True)
+        raise typer.Exit(code=1)
+    
+    if method.lower() == 'pruning' and not (0.0 <= amount <= 1.0):
+        typer.echo(f"❌ Pruning amount must be between 0.0 and 1.0, got: {amount}", err=True)
+        raise typer.Exit(code=1)
+    
+    try:
+        typer.echo(f"🔧 Loading model: {model_path}")
+        
+        # Load the model artifact
+        model_artifact = load_model(str(model_path))
+        model = model_artifact.model
+        
+        typer.echo(f"✅ Model loaded successfully")
+        typer.echo(f"   Architecture: {model_artifact.get_params()['model_class']}")
+        typer.echo(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        # Apply optimization
+        kwargs = {'amount': amount} if method.lower() == 'pruning' else {}
+        optimized_model, optimization_metadata = optimize_model(model, method, **kwargs)
+        
+        # Update model artifact with optimized model
+        model_artifact.model = optimized_model
+        
+        # Update metadata to include optimization info
+        model_artifact.meta['optimization'] = optimization_metadata
+        
+        # Create new ModelAPI instance and save
+        optimized_api = ModelAPI(optimized_model, model_artifact.meta)
+        optimized_api.save(str(output_path))
+        
+        typer.echo(f"✅ Optimized model saved: {output_path}")
+        typer.echo(f"📊 Optimization Results:")
+        typer.echo(f"   Method: {optimization_metadata['method']}")
+        typer.echo(f"   Size reduction: {optimization_metadata['size_reduction']:.1%}")
+        typer.echo(f"   Parameter reduction: {optimization_metadata['parameter_reduction']:.1%}")
+        typer.echo(f"   Original size: {optimization_metadata['original_size_mb']:.2f} MB")
+        typer.echo(f"   Optimized size: {optimization_metadata['optimized_size_mb']:.2f} MB")
+        
+    except Exception as e:
+        typer.echo(f"❌ Optimization failed: {e}", err=True)
         raise typer.Exit(code=1)
 
 @app.command()
@@ -222,6 +292,12 @@ def predict(
         typer.echo(f"   Architecture: {model.get_params()['model_class']}")
         typer.echo(f"   Input dimensions: {model.get_params()['input_dimensions']}")
         
+        # Show optimization info if available
+        params = model.get_params()
+        if 'optimization' in params:
+            opt_info = params['optimization']
+            typer.echo(f"   Optimized: {opt_info['method']} (size reduction: {opt_info['size_reduction']:.1%})")
+        
         # Load data
         import pandas as pd
         datasets = {}
@@ -273,6 +349,15 @@ def evaluate(
                 typer.echo(f"   {metric}: {value}")
         else:
             typer.echo("ℹ️  No stored evaluation metrics found")
+        
+        # Show optimization info if available
+        params = model.get_params()
+        if 'optimization' in params:
+            opt_info = params['optimization']
+            typer.echo(f"\n🔧 Model Optimization:")
+            typer.echo(f"   Method: {opt_info['method']}")
+            typer.echo(f"   Size reduction: {opt_info['size_reduction']:.1%}")
+            typer.echo(f"   Parameter reduction: {opt_info['parameter_reduction']:.1%}")
             
     except Exception as e:
         typer.echo(f"❌ Evaluation failed: {e}", err=True)
@@ -292,6 +377,7 @@ def info():
     typer.echo("• Native support for heterogeneous data modalities")
     typer.echo("• Built-in visualization and interpretability")
     typer.echo("• Developer-friendly SDK with MLOps integration")
+    typer.echo("• Post-training optimization (quantization, pruning)")
 
 if __name__ == '__main__':
     app()
