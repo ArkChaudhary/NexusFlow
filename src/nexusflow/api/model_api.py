@@ -17,9 +17,14 @@ class NexusFlowModelArtifact:
         Initialize the model artifact.
         
         Args:
-            model: Trained NexusFormer model
+            model: Trained NexusFormer model (must be torch.nn.Module)
             preprocess_meta: Metadata including config, input dimensions, training info
         """
+        # Add type checking to prevent nested artifacts
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError(f"Expected torch.nn.Module, got {type(model)}. "
+                        f"If passing a NexusFlowModelArtifact, use artifact.model instead.")
+        
         self.model = model
         self.model.eval()  # Always in eval mode for inference
         self.meta = preprocess_meta
@@ -582,6 +587,58 @@ class ModelAPI:
     def get_params(self):
         """Delegate to artifact get_params method."""
         return self.artifact.get_params()
+
+def extract_pytorch_model(obj):
+    """
+    Safely extract the actual PyTorch model from any object.
+    
+    Args:
+        obj: Could be a torch.nn.Module, NexusFlowModelArtifact, or nested artifact
+    
+    Returns:
+        torch.nn.Module: The actual PyTorch model
+    """
+    # If it's already a PyTorch model, return it
+    if isinstance(obj, torch.nn.Module) and not hasattr(obj, 'model'):
+        return obj
+    
+    # If it's an artifact, extract the model
+    current = obj
+    max_depth = 10  # Prevent infinite loops
+    depth = 0
+    
+    while hasattr(current, 'model') and depth < max_depth:
+        current = current.model
+        depth += 1
+        
+        # If we've found a PyTorch model, return it
+        if isinstance(current, torch.nn.Module) and not hasattr(current, 'model'):
+            return current
+    
+    # If we still don't have a proper model, raise an error
+    raise ValueError(f"Could not extract PyTorch model from {type(obj)}")
+
+def create_optimized_artifact(original_artifact, optimized_model, optimization_metadata):
+    """
+    Create a new artifact with an optimized model.
+    
+    Args:
+        original_artifact: Original NexusFlowModelArtifact
+        optimized_model: Optimized PyTorch model
+        optimization_metadata: Metadata about the optimization
+    
+    Returns:
+        NexusFlowModelArtifact: New artifact with optimized model
+    """
+    # Ensure we have the actual PyTorch model
+    pytorch_model = extract_pytorch_model(optimized_model)
+    
+    # Copy metadata and add optimization info
+    new_meta = original_artifact.meta.copy()
+    new_meta['optimization'] = optimization_metadata
+    
+    # Create new artifact
+    return NexusFlowModelArtifact(pytorch_model, new_meta)
 
 # Convenience function for loading .nxf files
 def load_model(path: str) -> NexusFlowModelArtifact:
