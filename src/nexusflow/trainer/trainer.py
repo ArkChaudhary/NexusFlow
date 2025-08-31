@@ -82,14 +82,14 @@ class MLOpsLogger:
             'total_parameters': total_params,
             'trainable_parameters': trainable_params,
             'model_size_mb': total_params * 4 / (1024 * 1024),
-            'use_moe': config.architecture.use_moe,
-            'use_flash_attn': config.architecture.use_flash_attn,
+            'use_moe': config.architecture.use_moe,  # Direct attribute access
+            'use_flash_attn': config.architecture.use_flash_attn,  # Direct attribute access
             'use_advanced_preprocessing': config.training.use_advanced_preprocessing,
             'num_experts': config.architecture.num_experts if config.architecture.use_moe else 0
         }
         
         logger.info(f"🏗️  Architecture Stats: {trainable_params:,} trainable params, "
-                   f"{arch_stats['model_size_mb']:.2f}MB")
+                    f"{arch_stats['model_size_mb']:.2f}MB")
         
         self.log_params(arch_stats)
     
@@ -214,6 +214,9 @@ class Trainer:
 
     def _initialize_preprocessing_aware_model(self):
         """Initialize model with preprocessing awareness."""
+        embed_dim = self.cfg.architecture.global_embed_dim  # Direct attribute access
+        refinement_iterations = self.cfg.architecture.refinement_iterations  # Direct attribute access
+        
         # Determine encoder strategy based on preprocessing
         if self.cfg.datasets:
             transformer_types = {d.transformer_type for d in self.cfg.datasets}
@@ -223,18 +226,15 @@ class Trainer:
                 encoder_type = 'standard'
         else:
             encoder_type = 'standard'
-                
-        embed_dim = self.cfg.architecture.global_embed_dim
-        refinement_iterations = self.cfg.architecture.refinement_iterations
-
+        
         self.model = NexusFormer(
             input_dims=self.input_dims,
             embed_dim=embed_dim,
             refinement_iterations=refinement_iterations,
             encoder_type=encoder_type,
-            use_moe=self.cfg.architecture.use_moe,
-            num_experts=self.cfg.architecture.num_experts,
-            use_flash_attn=self.cfg.architecture.use_flash_attn
+            use_moe=self.cfg.architecture.use_moe,  # Direct attribute access
+            num_experts=self.cfg.architecture.num_experts,  # Direct attribute access
+            use_flash_attn=self.cfg.architecture.use_flash_attn  # Direct attribute access
         ).to(self.device)
         
         # Store preprocessing information in model for inference
@@ -247,7 +247,7 @@ class Trainer:
         
         logger.info(f"🧠 Enhanced model initialized: {encoder_type} encoders")
         logger.info(f"   Advanced features: MoE={self.cfg.architecture.use_moe}, "
-                   f"FlashAttn={self.cfg.architecture.use_flash_attn}")
+                    f"FlashAttn={self.cfg.architecture.use_flash_attn}")
         logger.info(f"   Preprocessing: {'integrated' if self.preprocessors else 'legacy'}")
 
     def _setup_optimizer(self):
@@ -716,17 +716,17 @@ class Trainer:
             return
         
         # Create enhanced model instance
-        embed_dim = self.cfg.architecture.global_embed_dim
-        refinement_iterations = self.cfg.architecture.refinement_iterations
+        embed_dim = self.cfg.architecture.global_embed_dim  # Direct attribute access
+        refinement_iterations = self.cfg.architecture.refinement_iterations  # Direct attribute access
         
         model = NexusFormer(
             input_dims=self.input_dims,
             embed_dim=embed_dim,
             refinement_iterations=refinement_iterations,
             encoder_type=getattr(self.model, 'encoder_type', 'standard'),
-            use_moe=self.cfg.architecture.use_moe,
-            num_experts=self.cfg.architecture.num_experts,
-            use_flash_attn=self.cfg.architecture.use_flash_attn
+            use_moe=self.cfg.architecture.use_moe,  # Direct attribute access
+            num_experts=self.cfg.architecture.num_experts,  # Direct attribute access
+            use_flash_attn=self.cfg.architecture.use_flash_attn  # Direct attribute access
         )
         model.load_state_dict(self.best_model_state)
         
