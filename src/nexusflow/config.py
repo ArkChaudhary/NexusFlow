@@ -18,23 +18,27 @@ class SyntheticDataConfig(BaseModel):
     n_samples: int = Field(default=256, description="Number of synthetic samples to generate")
     feature_dim: int = Field(default=5, description="Number of features per dataset")
 
-class AdvancedArchitectureConfig(BaseModel):
-    """Configuration for advanced architecture features."""
-    use_moe: bool = Field(default=False, description="Enable Mixture of Experts")
-    num_experts: int = Field(default=4, description="Number of experts in MoE layer")
-    use_flash_attn: bool = Field(default=True, description="Enable FlashAttention optimization")
-    top_k_contexts: Optional[int] = Field(default=None, description="Limit cross-attention to top-k contexts")
+class OptimizerConfig(BaseModel):
+    name: str = 'adam'
+    lr: float = 0.001
+    weight_decay: float = 0.0001
+
+class SplitConfig(BaseModel):
+    test_size: float = 0.2
+    validation_size: float = 0.2
+    randomize: bool = True
 
 class TrainingConfig(BaseModel):
     batch_size: int = 32
     epochs: int = 10
-    optimizer: Dict[str, Any] = Field(default_factory=lambda: {'name': 'adam', 'lr': 1e-3})
-    split_config: Dict[str, Any] = Field(default_factory=lambda: {'test_size': 0.15, 'validation_size': 0.15, 'randomize': True})
+    optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
+    split_config: SplitConfig = Field(default_factory=SplitConfig)
     
+    # Synthetic data options
     use_synthetic: bool = Field(default=False, description="Whether to use synthetic data instead of real data")
-    synthetic: SyntheticDataConfig | None = Field(default=None, description="Synthetic data generation settings")
+    synthetic: Optional[SyntheticDataConfig] = Field(default=None, description="Synthetic data generation settings")
     
-    # Advanced training features
+    # Training features
     early_stopping: bool = Field(default=False, description="Enable early stopping")
     patience: int = Field(default=5, description="Early stopping patience")
     gradient_clipping: float = Field(default=1.0, description="Gradient clipping threshold")
@@ -49,6 +53,18 @@ class TrainingConfig(BaseModel):
             self.synthetic = SyntheticDataConfig()
         return self
 
+class ArchitectureConfig(BaseModel):
+    global_embed_dim: int = Field(default=128, description="Global embedding dimension")
+    refinement_iterations: int = Field(default=4, description="Number of refinement iterations")
+    
+    # MoE configuration
+    use_moe: bool = Field(default=False, description="Enable Mixture of Experts")
+    num_experts: int = Field(default=6, description="Number of expert networks")
+    
+    # Attention configuration  
+    use_flash_attn: bool = Field(default=True, description="Enable FlashAttention optimization")
+    top_k_contexts: Optional[int] = Field(default=None, description="Limit cross-attention to top-k contexts")
+
 class MLOpsConfig(BaseModel):
     logging_provider: Literal['stdout', 'wandb', 'mlflow'] = 'stdout'
     experiment_name: str = 'nexus_run'
@@ -58,13 +74,10 @@ class ConfigModel(BaseModel):
     project_name: str
     primary_key: str
     target: Dict[str, Any]
-    architecture: Dict[str, Any]
+    architecture: ArchitectureConfig = Field(default_factory=ArchitectureConfig)
     datasets: Optional[List[DatasetConfig]] = None
-    training: TrainingConfig = TrainingConfig()
-    mlops: MLOpsConfig = MLOpsConfig()
-    
-    # Advanced architecture configuration
-    advanced: AdvancedArchitectureConfig = AdvancedArchitectureConfig()
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    mlops: MLOpsConfig = Field(default_factory=MLOpsConfig)
 
     @model_validator(mode='after')
     def _require_data_or_synthetic(self):
@@ -75,8 +88,8 @@ class ConfigModel(BaseModel):
     @model_validator(mode='after')
     def _validate_moe_config(self):
         """Validate MoE configuration parameters."""
-        if self.advanced.use_moe:
-            if self.advanced.num_experts < 2:
+        if self.architecture.use_moe:
+            if self.architecture.num_experts < 2:
                 raise ValueError('num_experts must be >= 2 when MoE is enabled')
         return self
     
@@ -120,12 +133,12 @@ def load_config_from_file(path: str) -> ConfigModel:
     
     # Enhanced logging with preprocessing features
     advanced_features = []
-    if cfg.advanced.use_moe:
-        advanced_features.append(f"MoE({cfg.advanced.num_experts} experts)")
-    if cfg.advanced.use_flash_attn:
+    if cfg.architecture.use_moe:
+        advanced_features.append(f"MoE({cfg.architecture.num_experts} experts)")
+    if cfg.architecture.use_flash_attn:
         advanced_features.append("FlashAttention")
-    if cfg.advanced.top_k_contexts:
-        advanced_features.append(f"TopK({cfg.advanced.top_k_contexts})")
+    if cfg.architecture.top_k_contexts:
+        advanced_features.append(f"TopK({cfg.architecture.top_k_contexts})")
     if cfg.training.use_advanced_preprocessing:
         advanced_features.append("Advanced Preprocessing")
     

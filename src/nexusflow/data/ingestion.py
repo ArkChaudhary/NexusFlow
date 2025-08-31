@@ -93,7 +93,7 @@ def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFra
         
         # Exclude primary key and target from preprocessing
         feature_df = df.drop(columns=[cfg.primary_key], errors='ignore')
-        target_col = cfg.target.get('target_column')
+        target_col = cfg.target['target_column']
         if target_col and target_col in feature_df.columns:
             feature_df = feature_df.drop(columns=[target_col])
         
@@ -312,12 +312,12 @@ def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame],
     # Get reference dataset for splitting
     reference_df = list(datasets.values())[0]
     
-    # Split indices
+    # Split indices - access Pydantic model attributes directly
     train_indices, val_indices, test_indices = split_df(
         reference_df,
-        test_size=cfg.training.split_config.get("test_size", 0.15),
-        val_size=cfg.training.split_config.get("validation_size", 0.15),
-        randomize=cfg.training.split_config.get("randomize", True),
+        test_size=cfg.training.split_config.test_size,
+        val_size=cfg.training.split_config.validation_size,
+        randomize=cfg.training.split_config.randomize,
     )
     
     # Split all datasets using the same indices

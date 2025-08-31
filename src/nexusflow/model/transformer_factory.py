@@ -10,7 +10,7 @@ class TransformerFactory:
     
     @staticmethod
     def create_encoder(dataset_config: DatasetConfig, input_dim: int, embed_dim: int = 64, 
-                      use_moe: bool = False, num_experts: int = 4, use_flash_attn: bool = True) -> nn.Module:
+                    use_moe: bool = False, num_experts: int = 4, use_flash_attn: bool = True) -> nn.Module:
         """Create appropriate encoder based on dataset configuration with advanced features."""
         transformer_type = dataset_config.transformer_type.lower()
         complexity = dataset_config.complexity.lower()

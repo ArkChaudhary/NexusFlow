@@ -82,10 +82,10 @@ class MLOpsLogger:
             'total_parameters': total_params,
             'trainable_parameters': trainable_params,
             'model_size_mb': total_params * 4 / (1024 * 1024),
-            'use_moe': config.advanced.use_moe,
-            'use_flash_attn': config.advanced.use_flash_attn,
+            'use_moe': config.architecture.use_moe,
+            'use_flash_attn': config.architecture.use_flash_attn,
             'use_advanced_preprocessing': config.training.use_advanced_preprocessing,
-            'num_experts': config.advanced.num_experts if config.advanced.use_moe else 0
+            'num_experts': config.architecture.num_experts if config.architecture.use_moe else 0
         }
         
         logger.info(f"🏗️  Architecture Stats: {trainable_params:,} trainable params, "
@@ -214,9 +214,6 @@ class Trainer:
 
     def _initialize_preprocessing_aware_model(self):
         """Initialize model with preprocessing awareness."""
-        embed_dim = self.cfg.architecture.get('global_embed_dim', 64)
-        refinement_iterations = self.cfg.architecture.get('refinement_iterations', 3)
-        
         # Determine encoder strategy based on preprocessing
         if self.cfg.datasets:
             transformer_types = {d.transformer_type for d in self.cfg.datasets}
@@ -226,15 +223,18 @@ class Trainer:
                 encoder_type = 'standard'
         else:
             encoder_type = 'standard'
-        
+                
+        embed_dim = self.cfg.architecture.global_embed_dim
+        refinement_iterations = self.cfg.architecture.refinement_iterations
+
         self.model = NexusFormer(
             input_dims=self.input_dims,
             embed_dim=embed_dim,
             refinement_iterations=refinement_iterations,
             encoder_type=encoder_type,
-            use_moe=self.cfg.advanced.use_moe,
-            num_experts=self.cfg.advanced.num_experts,
-            use_flash_attn=self.cfg.advanced.use_flash_attn
+            use_moe=self.cfg.architecture.use_moe,
+            num_experts=self.cfg.architecture.num_experts,
+            use_flash_attn=self.cfg.architecture.use_flash_attn
         ).to(self.device)
         
         # Store preprocessing information in model for inference
@@ -246,17 +246,17 @@ class Trainer:
             }
         
         logger.info(f"🧠 Enhanced model initialized: {encoder_type} encoders")
-        logger.info(f"   Advanced features: MoE={self.cfg.advanced.use_moe}, "
-                   f"FlashAttn={self.cfg.advanced.use_flash_attn}")
+        logger.info(f"   Advanced features: MoE={self.cfg.architecture.use_moe}, "
+                   f"FlashAttn={self.cfg.architecture.use_flash_attn}")
         logger.info(f"   Preprocessing: {'integrated' if self.preprocessors else 'legacy'}")
 
     def _setup_optimizer(self):
         """Setup optimizer with enhanced features."""
         optim_config = self.cfg.training.optimizer
-        lr = optim_config.get('lr', 1e-3)
+        lr = optim_config.lr  # Direct attribute access instead of .get()
         
-        if optim_config.get('name', 'adam').lower() == 'adam':
-            weight_decay = optim_config.get('weight_decay', 1e-4)
+        if optim_config.name.lower() == 'adam':
+            weight_decay = optim_config.weight_decay  # Direct attribute access
             self.optim = torch.optim.Adam(
                 self.model.parameters(), 
                 lr=lr, 
@@ -716,17 +716,17 @@ class Trainer:
             return
         
         # Create enhanced model instance
-        embed_dim = self.cfg.architecture.get('global_embed_dim', 64)
-        refinement_iterations = self.cfg.architecture.get('refinement_iterations', 3)
+        embed_dim = self.cfg.architecture.global_embed_dim
+        refinement_iterations = self.cfg.architecture.refinement_iterations
         
         model = NexusFormer(
             input_dims=self.input_dims,
             embed_dim=embed_dim,
             refinement_iterations=refinement_iterations,
             encoder_type=getattr(self.model, 'encoder_type', 'standard'),
-            use_moe=self.cfg.advanced.use_moe,
-            num_experts=self.cfg.advanced.num_experts,
-            use_flash_attn=self.cfg.advanced.use_flash_attn
+            use_moe=self.cfg.architecture.use_moe,
+            num_experts=self.cfg.architecture.num_experts,
+            use_flash_attn=self.cfg.architecture.use_flash_attn
         )
         model.load_state_dict(self.best_model_state)
         
@@ -745,9 +745,9 @@ class Trainer:
             },
             'architecture_features': {
                 'encoder_type': getattr(self.model, 'encoder_type', 'standard'),
-                'use_moe': self.cfg.advanced.use_moe,
-                'num_experts': self.cfg.advanced.num_experts,
-                'use_flash_attn': self.cfg.advanced.use_flash_attn,
+                'use_moe': self.cfg.architecture.use_moe,
+                'num_experts': self.cfg.architecture.num_experts,
+                'use_flash_attn': self.cfg.architecture.use_flash_attn,
                 'refinement_iterations': refinement_iterations,
                 'embed_dim': embed_dim
             },
