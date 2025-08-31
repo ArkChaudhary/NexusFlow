@@ -6,24 +6,39 @@ from torch.nn.utils import prune
 from loguru import logger
 from pathlib import Path
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 
 
-def quantize_model(model: nn.Module, qconfig_spec: Optional[Dict] = None) -> nn.Module:
+def _extract_pytorch_model(model_input) -> nn.Module:
+    """Extract PyTorch model from either raw model or NexusFlowModelArtifact."""
+    if hasattr(model_input, 'model'):
+        # It's a NexusFlowModelArtifact
+        return model_input.model
+    elif isinstance(model_input, nn.Module):
+        # It's already a PyTorch model
+        return model_input
+    else:
+        raise ValueError(f"Expected nn.Module or NexusFlowModelArtifact, got {type(model_input)}")
+
+
+def quantize_model(model_input, qconfig_spec: Optional[Dict] = None):
     """
     Apply dynamic quantization to reduce model size and improve inference speed.
     
     Args:
-        model: PyTorch model to quantize
+        model_input: PyTorch model or NexusFlowModelArtifact to quantize
         qconfig_spec: Optional quantization configuration specification
         
     Returns:
-        Quantized model
+        Quantized model (same type as input)
     """
     logger.info("🔧 Starting dynamic quantization...")
     
+    # Extract PyTorch model
+    pytorch_model = _extract_pytorch_model(model_input)
+    
     # Calculate original model size
-    original_size = sum(p.numel() * 4 for p in model.parameters()) / (1024 * 1024)  # MB
+    original_size = sum(p.numel() * 4 for p in pytorch_model.parameters()) / (1024 * 1024)  # MB
     logger.info(f"   Original model size: {original_size:.2f} MB")
     
     # Define layers to quantize (typically Linear layers)
@@ -31,8 +46,8 @@ def quantize_model(model: nn.Module, qconfig_spec: Optional[Dict] = None) -> nn.
     
     # Apply dynamic quantization
     start_time = time.time()
-    quantized_model = quantize_dynamic(
-        model, 
+    quantized_pytorch_model = quantize_dynamic(
+        pytorch_model, 
         qconfig_spec, 
         dtype=torch.qint8
     )
@@ -41,7 +56,7 @@ def quantize_model(model: nn.Module, qconfig_spec: Optional[Dict] = None) -> nn.
     # Calculate quantized model size
     quantized_size = sum(
         param.numel() * (1 if param.dtype == torch.qint8 else 4) 
-        for param in quantized_model.parameters()
+        for param in quantized_pytorch_model.parameters()
     ) / (1024 * 1024)
     
     size_reduction = ((original_size - quantized_size) / original_size) * 100
@@ -50,26 +65,35 @@ def quantize_model(model: nn.Module, qconfig_spec: Optional[Dict] = None) -> nn.
     logger.info(f"   Quantized model size: {quantized_size:.2f} MB")
     logger.info(f"   Size reduction: {size_reduction:.1f}%")
     logger.info(f"   Quantization time: {quantization_time:.2f}s")
-    logger.info(f"   Target layers: {len([m for m in model.modules() if type(m) in qconfig_spec])} Linear layers")
+    logger.info(f"   Target layers: {len([m for m in pytorch_model.modules() if type(m) in qconfig_spec])} Linear layers")
     
-    return quantized_model
+    # Return the same type as input
+    if hasattr(model_input, 'model'):
+        # Update the artifact's model
+        model_input.model = quantized_pytorch_model
+        return model_input
+    else:
+        return quantized_pytorch_model
 
 
-def prune_model(model: nn.Module, amount: float = 0.2) -> nn.Module:
+def prune_model(model_input, amount: float = 0.2):
     """
     Apply global unstructured pruning to reduce model parameters.
     
     Args:
-        model: PyTorch model to prune
+        model_input: PyTorch model or NexusFlowModelArtifact to prune
         amount: Fraction of parameters to prune (0.0 to 1.0)
         
     Returns:
-        Pruned model with weights permanently removed
+        Pruned model (same type as input)
     """
     logger.info(f"✂️  Starting global unstructured pruning (amount={amount:.1%})...")
     
+    # Extract PyTorch model
+    pytorch_model = _extract_pytorch_model(model_input)
+    
     # Calculate original statistics
-    original_params = sum(p.numel() for p in model.parameters())
+    original_params = sum(p.numel() for p in pytorch_model.parameters())
     original_size = original_params * 4 / (1024 * 1024)  # MB
     
     logger.info(f"   Original parameters: {original_params:,}")
@@ -79,7 +103,7 @@ def prune_model(model: nn.Module, amount: float = 0.2) -> nn.Module:
     parameters_to_prune = []
     linear_layers = []
     
-    for name, module in model.named_modules():
+    for name, module in pytorch_model.named_modules():
         if isinstance(module, nn.Linear):
             parameters_to_prune.append((module, 'weight'))
             linear_layers.append(name)
@@ -88,7 +112,7 @@ def prune_model(model: nn.Module, amount: float = 0.2) -> nn.Module:
     
     if not parameters_to_prune:
         logger.warning("   No Linear layers found - skipping pruning")
-        return model
+        return model_input
     
     # Apply global unstructured pruning
     start_time = time.time()
@@ -105,7 +129,7 @@ def prune_model(model: nn.Module, amount: float = 0.2) -> nn.Module:
     pruning_time = time.time() - start_time
     
     # Calculate post-pruning statistics
-    pruned_params = sum(p.numel() for p in model.parameters())
+    pruned_params = sum(p.numel() for p in pytorch_model.parameters())
     pruned_size = pruned_params * 4 / (1024 * 1024)
     
     actual_sparsity = (original_params - pruned_params) / original_params
@@ -119,15 +143,20 @@ def prune_model(model: nn.Module, amount: float = 0.2) -> nn.Module:
     logger.info(f"   Pruning time: {pruning_time:.2f}s")
     logger.info(f"   Pruned layers: {len(linear_layers)}")
     
-    return model
+    # Return the same type as input
+    if hasattr(model_input, 'model'):
+        # The model was modified in-place, just return the artifact
+        return model_input
+    else:
+        return pytorch_model
 
 
-def optimize_model(model: nn.Module, method: str, **kwargs) -> tuple[nn.Module, Dict[str, Any]]:
+def optimize_model(model_input, method: str, **kwargs) -> tuple:
     """
     Apply optimization method to model and return optimization metadata.
     
     Args:
-        model: PyTorch model to optimize
+        model_input: PyTorch model or NexusFlowModelArtifact to optimize
         method: Optimization method ('quantization' or 'pruning')
         **kwargs: Additional arguments for optimization methods
         
@@ -136,25 +165,29 @@ def optimize_model(model: nn.Module, method: str, **kwargs) -> tuple[nn.Module, 
     """
     logger.info(f"🚀 Starting model optimization with method: {method}")
     
-    original_params = sum(p.numel() for p in model.parameters())
+    # Extract PyTorch model for statistics
+    pytorch_model = _extract_pytorch_model(model_input)
+    
+    original_params = sum(p.numel() for p in pytorch_model.parameters())
     original_size = original_params * 4 / (1024 * 1024)
     
     start_time = time.time()
     
     if method.lower() == 'quantization':
-        optimized_model = quantize_model(model, **kwargs)
+        optimized_model = quantize_model(model_input, **kwargs)
         optimization_type = 'dynamic_quantization'
     elif method.lower() == 'pruning':
         amount = kwargs.get('amount', 0.2)
-        optimized_model = prune_model(model, amount)
+        optimized_model = prune_model(model_input, amount)
         optimization_type = 'global_unstructured_pruning'
     else:
         raise ValueError(f"Unknown optimization method: {method}. Supported: 'quantization', 'pruning'")
     
     optimization_time = time.time() - start_time
     
-    # Calculate final statistics
-    final_params = sum(p.numel() for p in optimized_model.parameters() if p.requires_grad)
+    # Calculate final statistics from the optimized model
+    optimized_pytorch_model = _extract_pytorch_model(optimized_model)
+    final_params = sum(p.numel() for p in optimized_pytorch_model.parameters())
     final_size = final_params * 4 / (1024 * 1024)
     
     # Create optimization metadata
@@ -169,6 +202,10 @@ def optimize_model(model: nn.Module, method: str, **kwargs) -> tuple[nn.Module, 
         'size_reduction': (original_size - final_size) / original_size,
         'kwargs': kwargs
     }
+    
+    # Update model artifact metadata if applicable
+    if hasattr(optimized_model, 'meta'):
+        optimized_model.meta['optimization'] = metadata
     
     logger.info(f"🎯 Model optimization summary:")
     logger.info(f"   Method: {optimization_type}")
