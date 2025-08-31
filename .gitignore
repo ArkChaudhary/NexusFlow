@@ -7,6 +7,8 @@ nexusflow_demo
 NexusFlow.docx
 .vscode
 integration_test.py
+nexusflow_colab_demo/
+demo copy.ipynb
 
 
 # Byte-compiled / optimized / DLL files
