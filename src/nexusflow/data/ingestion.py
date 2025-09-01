@@ -124,8 +124,10 @@ def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFra
         # Transform features
         processed_features = preprocessor.transform(feature_df)
         
-        # Reconstruct full dataset with primary key and target
-        processed_df = processed_features.copy()
+        # Reconstruct full dataset with primary key and target, using ONLY processed columns
+        final_feature_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+        processed_df = processed_features[final_feature_cols].copy()
+        
         processed_df[cfg.primary_key] = df[cfg.primary_key]
         if target_col and target_col in df.columns:
             processed_df[target_col] = df[target_col]
