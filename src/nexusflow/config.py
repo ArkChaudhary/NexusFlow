@@ -1,9 +1,15 @@
-"""Enhanced configuration loader with preprocessing support for NexusFlow Phase 2."""
+"""Enhanced configuration loader with relational data support for NexusFlow."""
 from pydantic import BaseModel, Field, ValidationError, model_validator
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Union
 import yaml
 from loguru import logger
 import os
+
+class ForeignKeyConfig(BaseModel):
+    """Configuration for foreign key relationships."""
+    columns: Union[str, List[str]]  # Column(s) in this table
+    references_table: str           # Table being referenced
+    references_columns: Union[str, List[str]]  # Column(s) in referenced table
 
 class DatasetConfig(BaseModel):
     name: str
@@ -12,6 +18,10 @@ class DatasetConfig(BaseModel):
     context_weight: float = 1.0
     categorical_columns: Optional[List[str]] = None
     numerical_columns: Optional[List[str]] = None
+    
+    # Relational data support
+    primary_key: Union[str, List[str]]  # Can be composite key
+    foreign_keys: Optional[List[ForeignKeyConfig]] = None
 
 class SyntheticDataConfig(BaseModel):
     """Configuration for synthetic data generation."""
@@ -72,12 +82,25 @@ class MLOpsConfig(BaseModel):
 
 class ConfigModel(BaseModel):
     project_name: str
-    primary_key: str
+    # Remove top-level primary_key - now defined per dataset
     target: Dict[str, Any]
     architecture: ArchitectureConfig = Field(default_factory=ArchitectureConfig)
     datasets: Optional[List[DatasetConfig]] = None
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     mlops: MLOpsConfig = Field(default_factory=MLOpsConfig)
+    
+    # Backward compatibility property
+    @property
+    def primary_key(self) -> str:
+        """Backward compatibility: return target table's primary key."""
+        if self.datasets:
+            target_table = self.target.get('target_table')
+            if target_table:
+                for dataset in self.datasets:
+                    if dataset.name == target_table:
+                        pk = dataset.primary_key
+                        return pk[0] if isinstance(pk, list) else pk
+        return "id"  # fallback
 
     @model_validator(mode='after')
     def _require_data_or_synthetic(self):
@@ -91,6 +114,36 @@ class ConfigModel(BaseModel):
         if self.architecture.use_moe:
             if self.architecture.num_experts < 2:
                 raise ValueError('num_experts must be >= 2 when MoE is enabled')
+        return self
+    
+    @model_validator(mode='after')
+    def _validate_relational_config(self):
+        """Validate relational data configuration."""
+        if self.datasets and not self.training.use_synthetic:
+            # Ensure target table exists
+            target_table = self.target.get('target_table')
+            if target_table:
+                table_names = [d.name for d in self.datasets]
+                if target_table not in table_names:
+                    raise ValueError(f"target_table '{target_table}' not found in datasets: {table_names}")
+            
+            # Validate foreign key references
+            for dataset in self.datasets:
+                if dataset.foreign_keys:
+                    for fk in dataset.foreign_keys:
+                        # Check if referenced table exists
+                        ref_table = fk.references_table
+                        if ref_table not in [d.name for d in self.datasets]:
+                            raise ValueError(f"Foreign key in '{dataset.name}' references unknown table: '{ref_table}'")
+                        
+                        # Validate column consistency
+                        fk_cols = fk.columns if isinstance(fk.columns, list) else [fk.columns]
+                        ref_cols = fk.references_columns if isinstance(fk.references_columns, list) else [fk.references_columns]
+                        
+                        if len(fk_cols) != len(ref_cols):
+                            raise ValueError(f"Foreign key column count mismatch in '{dataset.name}': "
+                                           f"{len(fk_cols)} columns reference {len(ref_cols)} columns")
+        
         return self
     
     @model_validator(mode='after')
@@ -117,7 +170,7 @@ class ConfigModel(BaseModel):
         return self
 
 def load_config_from_file(path: str) -> ConfigModel:
-    """Load and validate configuration from YAML file with preprocessing support."""
+    """Load and validate configuration from YAML file with relational data support."""
     if not os.path.exists(path):
         logger.error(f"Config file not found: {path}")
         raise FileNotFoundError(path)
@@ -131,7 +184,7 @@ def load_config_from_file(path: str) -> ConfigModel:
         logger.error("Configuration validation failed: {}".format(e))
         raise
     
-    # Enhanced logging with preprocessing features
+    # Enhanced logging with relational and preprocessing features
     advanced_features = []
     if cfg.architecture.use_moe:
         advanced_features.append(f"MoE({cfg.architecture.num_experts} experts)")
@@ -142,6 +195,13 @@ def load_config_from_file(path: str) -> ConfigModel:
     if cfg.training.use_advanced_preprocessing:
         advanced_features.append("Advanced Preprocessing")
     
+    # Check for relational features
+    if cfg.datasets:
+        has_foreign_keys = any(d.foreign_keys for d in cfg.datasets)
+        has_composite_keys = any(isinstance(d.primary_key, list) for d in cfg.datasets)
+        if has_foreign_keys or has_composite_keys:
+            advanced_features.append("Relational Data")
+    
     features_str = ", ".join(advanced_features) if advanced_features else "None"
     
     dataset_types = [d.transformer_type for d in cfg.datasets] if cfg.datasets else ["synthetic"]
@@ -151,6 +211,22 @@ def load_config_from_file(path: str) -> ConfigModel:
     logger.info(f"  Transformer types: {set(dataset_types)}")
     logger.info(f"  Advanced features: {features_str}")
     logger.info(f"  MLOps provider: {cfg.mlops.logging_provider}")
+    
+    # Log relational configuration
+    if cfg.datasets:
+        target_table = cfg.target.get('target_table')
+        if target_table:
+            logger.info(f"  Target table: {target_table}")
+        
+        # Log foreign key relationships
+        total_relationships = 0
+        for dataset in cfg.datasets:
+            if dataset.foreign_keys:
+                total_relationships += len(dataset.foreign_keys)
+                logger.info(f"    {dataset.name}: {len(dataset.foreign_keys)} foreign key(s)")
+        
+        if total_relationships > 0:
+            logger.info(f"  Total relational relationships: {total_relationships}")
     
     # Log preprocessing configuration
     if cfg.datasets and cfg.training.use_advanced_preprocessing:

@@ -7,7 +7,7 @@ from typing import Dict, Tuple, List, Optional, Any
 import os
 import torch
 
-from nexusflow.config import ConfigModel
+from nexusflow.config import ConfigModel, DatasetConfig
 from nexusflow.data.dataset import NexusFlowDataset
 from nexusflow.data.preprocessor import TabularPreprocessor, FeatureTokenizer, create_column_info_from_preprocessor
 
@@ -55,12 +55,9 @@ def validate_primary_key(df: pd.DataFrame, key: str) -> bool:
 
 def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFrame], Dict[str, TabularPreprocessor]]:
     """
-    Enhanced dataset loading with preprocessing pipeline.
-    
-    Returns:
-        Tuple of (processed_datasets, fitted_preprocessors)
+    Enhanced dataset loading with relational data support and preprocessing pipeline.
     """
-    logger.info("🔄 Loading datasets with advanced preprocessing...")
+    logger.info("🔄 Loading datasets with relational support and preprocessing...")
     
     raw_datasets = {}
     preprocessors = {}
@@ -69,80 +66,83 @@ def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFra
     for dataset_cfg in cfg.datasets:
         path = f"datasets/{dataset_cfg.name}"
         df = load_table(path)
-        validate_primary_key(df, cfg.primary_key)
+        
+        # Validate primary key for this specific dataset
+        pk = dataset_cfg.primary_key
+        pk_cols = pk if isinstance(pk, list) else [pk]
+        
+        for pk_col in pk_cols:
+            if pk_col not in df.columns:
+                logger.error(f"Primary key '{pk_col}' not found in {dataset_cfg.name}")
+                raise KeyError(f"Primary key '{pk_col}' missing from {dataset_cfg.name}")
+        
         raw_datasets[dataset_cfg.name] = df
     
-    # Align datasets by primary key
-    aligned_datasets = align_datasets(raw_datasets, cfg.primary_key)
+    # Apply relational flattening instead of simple alignment
+    flattened_df = flatten_relational_data(raw_datasets, cfg)
+    
+    # For backward compatibility, create datasets dict with the flattened result
+    # This maintains the existing function signature
+    aligned_datasets = {cfg.datasets[0].name: flattened_df}  # Use first dataset name as key
     
     if not cfg.training.use_advanced_preprocessing:
         logger.info("Using simple preprocessing (fillna)")
         return aligned_datasets, {}
     
-    # Apply advanced preprocessing per dataset
-    processed_datasets = {}
+    # Apply preprocessing to the flattened dataset
+    logger.info("Applying advanced preprocessing to flattened relational data...")
     
-    for dataset_cfg in cfg.datasets:
-        dataset_name = dataset_cfg.name
-        df = aligned_datasets[dataset_name]
-        
-        logger.info(f"Preprocessing dataset: {dataset_name}")
-        
-        # Create and fit preprocessor
-        preprocessor = TabularPreprocessor()
-        
-        # Exclude primary key and target from preprocessing
-        feature_df = df.drop(columns=[cfg.primary_key], errors='ignore')
-        target_col = cfg.target['target_column']
-        if target_col and target_col in feature_df.columns:
-            feature_df = feature_df.drop(columns=[target_col])
-        
-        # Fit preprocessor with explicit column specification or auto-detection
-        categorical_cols = dataset_cfg.categorical_columns
-        numerical_cols = dataset_cfg.numerical_columns
-        
-        if cfg.training.auto_detect_types and (categorical_cols is None or numerical_cols is None):
-            logger.info(f"Auto-detecting column types for {dataset_name}")
-            preprocessor.fit(feature_df, categorical_cols, numerical_cols)
-        else:
-            logger.info(f"Using explicit column types for {dataset_name}")
-            # Validate specified columns exist
-            if categorical_cols:
-                missing_cats = [col for col in categorical_cols if col not in feature_df.columns]
-                if missing_cats:
-                    logger.warning(f"Categorical columns not found: {missing_cats}")
-                    categorical_cols = [col for col in categorical_cols if col in feature_df.columns]
-            
-            if numerical_cols:
-                missing_nums = [col for col in numerical_cols if col not in feature_df.columns]
-                if missing_nums:
-                    logger.warning(f"Numerical columns not found: {missing_nums}")
-                    numerical_cols = [col for col in numerical_cols if col in feature_df.columns]
-            
-            preprocessor.fit(feature_df, categorical_cols, numerical_cols)
-        
-        # Transform features
-        processed_features = preprocessor.transform(feature_df)
-        
-        # Reconstruct full dataset with primary key and target, using ONLY processed columns
-        final_feature_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
-        processed_df = processed_features[final_feature_cols].copy()
-        
-        processed_df[cfg.primary_key] = df[cfg.primary_key]
-        if target_col and target_col in df.columns:
-            processed_df[target_col] = df[target_col]
-        
-        processed_datasets[dataset_name] = processed_df
-        preprocessors[dataset_name] = preprocessor
-        
-        # Log preprocessing results
-        feature_info = preprocessor.get_feature_info()
-        logger.info(f"  ✅ {dataset_name} processed:")
-        logger.info(f"     Categorical features: {len(feature_info['categorical_columns'])}")
-        logger.info(f"     Numerical features: {len(feature_info['numerical_columns'])}")
-        logger.info(f"     Total vocabulary size: {sum(feature_info['vocab_sizes'].values())}")
+    dataset_cfg = cfg.datasets[0]  # Use first dataset config for preprocessing settings
+    df = flattened_df
     
-    logger.info("🎯 Advanced preprocessing complete")
+    preprocessor = TabularPreprocessor()
+    
+    # Exclude target column from preprocessing
+    target_col = cfg.target.get('target_column')
+    feature_df = df.copy()
+    if target_col and target_col in feature_df.columns:
+        feature_df = feature_df.drop(columns=[target_col])
+    
+    # Combine categorical/numerical columns from all datasets
+    all_categorical = []
+    all_numerical = []
+    
+    for ds_cfg in cfg.datasets:
+        if ds_cfg.categorical_columns:
+            all_categorical.extend(ds_cfg.categorical_columns)
+        if ds_cfg.numerical_columns:
+            all_numerical.extend(ds_cfg.numerical_columns)
+    
+    # Filter to only columns that exist in flattened data
+    existing_categorical = [col for col in all_categorical if col in feature_df.columns]
+    existing_numerical = [col for col in all_numerical if col in feature_df.columns]
+    
+    # Auto-detect remaining columns if enabled
+    if cfg.training.auto_detect_types:
+        remaining_cols = [col for col in feature_df.columns 
+                         if col not in existing_categorical and col not in existing_numerical]
+        
+        for col in remaining_cols:
+            if feature_df[col].dtype in ['object', 'category', 'bool']:
+                existing_categorical.append(col)
+            elif pd.api.types.is_numeric_dtype(feature_df[col]):
+                existing_numerical.append(col)
+    
+    # Fit and transform
+    preprocessor.fit(feature_df, existing_categorical, existing_numerical)
+    processed_features = preprocessor.transform(feature_df)
+    
+    # Reconstruct final dataset
+    final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+    processed_df = processed_features[final_cols].copy()
+    
+    if target_col and target_col in df.columns:
+        processed_df[target_col] = df[target_col]
+    
+    processed_datasets = {cfg.datasets[0].name: processed_df}
+    preprocessors = {cfg.datasets[0].name: preprocessor}
+    
+    logger.info("🎯 Relational preprocessing complete")
     return processed_datasets, preprocessors
 
 def align_datasets(datasets: Dict[str, pd.DataFrame], primary_key: str) -> Dict[str, pd.DataFrame]:
@@ -299,22 +299,22 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
 def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame], 
                             preprocessors: Dict[str, TabularPreprocessor] = None):
     """
-    Create enhanced dataloaders with preprocessing support.
+    Create enhanced dataloaders with relational data support.
     
     Args:
         cfg: Configuration object
-        datasets: Processed datasets
+        datasets: Processed datasets (now contains flattened relational data)
         preprocessors: Fitted preprocessors (optional)
         
     Returns:
         Tuple of (train_loader, val_loader, test_loader, preprocessing_metadata)
     """
-    logger.info("Creating enhanced dataloaders with preprocessing support...")
+    logger.info("Creating dataloaders for relational data...")
     
-    # Get reference dataset for splitting
+    # For relational data, we have a single flattened dataset
     reference_df = list(datasets.values())[0]
     
-    # Split indices - access Pydantic model attributes directly
+    # Split indices
     train_indices, val_indices, test_indices = split_df(
         reference_df,
         test_size=cfg.training.split_config.test_size,
@@ -322,25 +322,51 @@ def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame],
         randomize=cfg.training.split_config.randomize,
     )
     
-    # Split all datasets using the same indices
-    train_datasets = {name: df.iloc[train_indices.index] for name, df in datasets.items()}
-    val_datasets = {name: df.iloc[val_indices.index] for name, df in datasets.items()} if len(val_indices) > 0 else {}
-    test_datasets = {name: df.iloc[test_indices.index] for name, df in datasets.items()}
+    # Split the flattened dataset
+    train_df = reference_df.iloc[train_indices.index].reset_index(drop=True)
+    val_df = reference_df.iloc[val_indices.index].reset_index(drop=True) if len(val_indices) > 0 else pd.DataFrame()
+    test_df = reference_df.iloc[test_indices.index].reset_index(drop=True)
     
-    # Create enhanced datasets with preprocessing metadata
-    train_dataset, preprocessing_metadata = create_multi_table_dataset(
-        train_datasets, preprocessors or {}, cfg
-    )
+    # Create datasets - treat as single table for dataset creation
+    target_column = cfg.target['target_column']
     
-    val_dataset = None
-    if val_datasets:
-        val_dataset, _ = create_multi_table_dataset(
-            val_datasets, preprocessors or {}, cfg
-        )
+    train_dataset = NexusFlowDataset(train_df, target_col=target_column)
+    val_dataset = NexusFlowDataset(val_df, target_col=target_column) if len(val_df) > 0 else None
+    test_dataset = NexusFlowDataset(test_df, target_col=target_column)
     
-    test_dataset, _ = create_multi_table_dataset(
-        test_datasets, preprocessors or {}, cfg
-    )
+    # Create preprocessing metadata for relational data
+    preprocessing_metadata = {
+        'relational_data': True,
+        'original_datasets': len(cfg.datasets),
+        'flattened_features': len([col for col in reference_df.columns if col != target_column]),
+        'dataset_order': [cfg.datasets[0].name],  # Single flattened dataset
+        'feature_dimensions': [len([col for col in reference_df.columns if col != target_column])],
+        'preprocessor_info': {},
+        'column_mappings': {}
+    }
+    
+    # Add preprocessor info if available
+    if preprocessors:
+        preprocessor = list(preprocessors.values())[0]
+        feature_info = preprocessor.get_feature_info()
+        
+        preprocessing_metadata['preprocessor_info'][cfg.datasets[0].name] = {
+            'categorical_columns': feature_info['categorical_columns'],
+            'numerical_columns': feature_info['numerical_columns'],
+            'vocab_sizes': feature_info['vocab_sizes'],
+            'transformer_type': 'relational_flattened'
+        }
+        
+        # Set dataset metadata for compatibility
+        train_dataset.feature_dimensions = [len(feature_info['categorical_columns']) + len(feature_info['numerical_columns'])]
+        train_dataset.preprocessing_metadata = preprocessing_metadata
+        
+        if val_dataset:
+            val_dataset.feature_dimensions = train_dataset.feature_dimensions
+            val_dataset.preprocessing_metadata = preprocessing_metadata
+        
+        test_dataset.feature_dimensions = train_dataset.feature_dimensions
+        test_dataset.preprocessing_metadata = preprocessing_metadata
     
     # Create DataLoaders
     batch_size = cfg.training.batch_size
@@ -349,10 +375,11 @@ def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame],
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    logger.info(f"Enhanced DataLoaders created:")
+    logger.info(f"Relational DataLoaders created:")
     logger.info(f"  Train: {len(train_loader)} batches ({len(train_dataset)} samples)")
     logger.info(f"  Val: {len(val_loader) if val_loader else 0} batches ({len(val_dataset) if val_dataset else 0} samples)")
     logger.info(f"  Test: {len(test_loader)} batches ({len(test_dataset)} samples)")
+    logger.info(f"  Relational features: {preprocessing_metadata['flattened_features']} from {preprocessing_metadata['original_datasets']} tables")
     
     return train_loader, val_loader, test_loader, preprocessing_metadata
 
@@ -409,3 +436,175 @@ def get_feature_dimensions(datasets: Dict[str, pd.DataFrame], primary_key: str, 
         logger.debug(f"Dataset {name}: {len(feature_cols)} features")
     
     return dimensions
+
+def build_join_graph(datasets_config: List[DatasetConfig]) -> Dict[str, Any]:
+    """Build a dependency graph for table joins based on foreign key relationships."""
+    graph = {
+        'nodes': {},  # table_name -> DatasetConfig
+        'edges': [],  # (from_table, to_table, join_info)
+        'dependencies': {}  # table -> list of tables it depends on
+    }
+    
+    # Build nodes
+    for dataset in datasets_config:
+        graph['nodes'][dataset.name] = dataset
+        graph['dependencies'][dataset.name] = []
+    
+    # Build edges from foreign key relationships
+    for dataset in datasets_config:
+        if dataset.foreign_keys:
+            for fk in dataset.foreign_keys:
+                edge = {
+                    'from_table': dataset.name,
+                    'to_table': fk.references_table,
+                    'from_columns': fk.columns if isinstance(fk.columns, list) else [fk.columns],
+                    'to_columns': fk.references_columns if isinstance(fk.references_columns, list) else [fk.references_columns]
+                }
+                graph['edges'].append(edge)
+                graph['dependencies'][dataset.name].append(fk.references_table)
+    
+    logger.info(f"Join graph built: {len(graph['nodes'])} tables, {len(graph['edges'])} relationships")
+    return graph
+
+def flatten_relational_data(datasets: Dict[str, pd.DataFrame], cfg: ConfigModel) -> pd.DataFrame:
+    """
+    Intelligent relational data flattening using proper foreign key relationships.
+    
+    This replaces the old single-key alignment with true relational joins.
+    """
+    if cfg.training.use_synthetic or not cfg.datasets:
+        # Fallback for synthetic data or simple cases
+        return list(datasets.values())[0] if datasets else pd.DataFrame()
+    
+    logger.info("🔗 Starting intelligent relational data flattening...")
+    
+    # Build join graph
+    join_graph = build_join_graph(cfg.datasets)
+    
+    # Start with target table as base
+    target_table = cfg.target.get('target_table')
+    if not target_table or target_table not in datasets:
+        logger.warning("No target table specified, using first dataset as base")
+        target_table = list(datasets.keys())[0]
+    
+    base_df = datasets[target_table].copy()
+    logger.info(f"Base table: {target_table} ({len(base_df)} rows)")
+    
+    # Track which tables we've already joined
+    joined_tables = {target_table}
+    result_df = base_df
+    
+    # Iteratively join tables based on dependencies
+    max_iterations = len(datasets) * 2  # Prevent infinite loops
+    iteration = 0
+    
+    while len(joined_tables) < len(datasets) and iteration < max_iterations:
+        iteration += 1
+        progress_made = False
+        
+        for dataset_config in cfg.datasets:
+            table_name = dataset_config.name
+            
+            # Skip if already joined or no foreign keys
+            if table_name in joined_tables or not dataset_config.foreign_keys:
+                continue
+            
+            # Check if all referenced tables are already joined
+            can_join = True
+            for fk in dataset_config.foreign_keys:
+                if fk.references_table not in joined_tables:
+                    can_join = False
+                    break
+            
+            if can_join:
+                # Perform the join
+                table_df = datasets[table_name].copy()
+                
+                # Join with primary foreign key relationship
+                primary_fk = dataset_config.foreign_keys[0]  # Use first FK as primary
+                
+                from_cols = primary_fk.columns if isinstance(primary_fk.columns, list) else [primary_fk.columns]
+                to_cols = primary_fk.references_columns if isinstance(primary_fk.references_columns, list) else [primary_fk.references_columns]
+                
+                # Detect relationship type
+                ref_table_name = primary_fk.references_table
+                ref_key_counts = result_df[to_cols].drop_duplicates()
+                table_key_counts = table_df[from_cols].drop_duplicates()
+                
+                is_one_to_many = len(table_df) > len(table_key_counts)
+                
+                if is_one_to_many:
+                    logger.info(f"Aggregating {table_name} (one-to-many relationship)")
+                    table_df = _aggregate_for_join(table_df, from_cols, dataset_config)
+                
+                # Perform the join
+                result_df = result_df.merge(
+                    table_df, 
+                    left_on=to_cols, 
+                    right_on=from_cols, 
+                    how='left',
+                    suffixes=('', f'_{table_name}')
+                )
+                
+                # Clean up duplicate columns
+                duplicate_cols = [col for col in result_df.columns if col.endswith(f'_{table_name}')]
+                for dup_col in duplicate_cols:
+                    original_col = dup_col.replace(f'_{table_name}', '')
+                    if original_col in result_df.columns:
+                        result_df = result_df.drop(columns=[dup_col])
+                
+                joined_tables.add(table_name)
+                progress_made = True
+                
+                logger.info(f"✅ Joined {table_name}: {len(result_df)} rows, {len(result_df.columns)} columns")
+    
+    if len(joined_tables) < len(datasets):
+        missing_tables = set(d.name for d in cfg.datasets) - joined_tables
+        logger.warning(f"Could not join all tables. Missing: {missing_tables}")
+    
+    logger.info(f"🎯 Relational flattening complete: {len(result_df)} rows, {len(result_df.columns)} columns")
+    return result_df
+
+def _aggregate_for_join(df: pd.DataFrame, key_columns: List[str], dataset_config: DatasetConfig) -> pd.DataFrame:
+    """Aggregate one-to-many data before joining."""
+    # Identify feature columns (exclude keys)
+    feature_cols = [col for col in df.columns if col not in key_columns]
+    
+    # Separate categorical and numerical for different aggregation strategies
+    categorical_cols = dataset_config.categorical_columns or []
+    numerical_cols = dataset_config.numerical_columns or []
+    
+    # Auto-detect if not specified
+    if not categorical_cols and not numerical_cols:
+        for col in feature_cols:
+            if df[col].dtype in ['object', 'category', 'bool']:
+                categorical_cols.append(col)
+            elif pd.api.types.is_numeric_dtype(df[col]):
+                numerical_cols.append(col)
+    
+    agg_dict = {}
+    
+    # Aggregate numerical columns with multiple statistics
+    for col in numerical_cols:
+        if col in feature_cols:
+            agg_dict[f'{col}_mean'] = pd.NamedAgg(column=col, aggfunc='mean')
+            agg_dict[f'{col}_sum'] = pd.NamedAgg(column=col, aggfunc='sum')
+            agg_dict[f'{col}_std'] = pd.NamedAgg(column=col, aggfunc='std')
+            agg_dict[f'{col}_count'] = pd.NamedAgg(column=col, aggfunc='count')
+    
+    # Aggregate categorical columns with mode and count
+    for col in categorical_cols:
+        if col in feature_cols:
+            agg_dict[f'{col}_mode'] = pd.NamedAgg(column=col, aggfunc=lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.iloc[0])
+            agg_dict[f'{col}_nunique'] = pd.NamedAgg(column=col, aggfunc='nunique')
+    
+    if agg_dict:
+        aggregated = df.groupby(key_columns).agg(agg_dict).reset_index()
+        # Flatten column names
+        aggregated.columns = [col if isinstance(col, str) else col for col in aggregated.columns]
+    else:
+        # If no features to aggregate, just get unique keys
+        aggregated = df[key_columns].drop_duplicates().reset_index(drop=True)
+    
+    logger.debug(f"Aggregated {df.shape} -> {aggregated.shape}")
+    return aggregated

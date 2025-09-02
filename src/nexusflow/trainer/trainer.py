@@ -5,13 +5,13 @@ from torch.utils.data import DataLoader
 from loguru import logger
 from pathlib import Path
 import json
-import pickle
+import pandas as pd
 from typing import Dict, Optional, Any
 import time
 
 from nexusflow.config import ConfigModel
 from nexusflow.model.nexus_former import NexusFormer
-from nexusflow.data.ingestion import load_and_preprocess_datasets, make_dataloaders, align_datasets
+from nexusflow.data.ingestion import load_and_preprocess_datasets, make_dataloaders, flatten_relational_data, load_table
 from nexusflow.data.preprocessor import TabularPreprocessor
 from nexusflow.api.model_api import ModelAPI
 
@@ -155,7 +155,7 @@ class Trainer:
         self.mlops_logger.log_architecture_stats(self.model, self.cfg)
 
     def _setup_enhanced_data(self):
-        """Enhanced data setup with Phase 2 preprocessing pipeline."""
+        """Enhanced data setup with relational data support."""
         training_cfg = self.cfg.training
         
         if training_cfg.use_synthetic:
@@ -169,47 +169,59 @@ class Trainer:
             logger.info(f"   Synthetic data: {n_datasets} datasets × {feature_dim} features")
             
         else:
-            logger.info("📊 Loading datasets with enhanced preprocessing pipeline...")
+            logger.info("📊 Loading datasets with relational data support...")
             
-            # Use new preprocessing pipeline
+            # Use relational preprocessing pipeline
             if training_cfg.use_advanced_preprocessing:
                 self.datasets, self.preprocessors = load_and_preprocess_datasets(self.cfg)
-                logger.info(f"✅ Advanced preprocessing applied to {len(self.preprocessors)} datasets")
+                logger.info(f"✅ Relational preprocessing applied to {len(self.preprocessors)} dataset(s)")
                 
-                # Log preprocessing statistics
-                for dataset_name, preprocessor in self.preprocessors.items():
-                    feature_info = preprocessor.get_feature_info()
-                    logger.info(f"   {dataset_name}: {len(feature_info['categorical_columns'])} categorical, "
-                               f"{len(feature_info['numerical_columns'])} numerical features")
-            else:
-                # Fallback to legacy preprocessing
-                logger.info("Using legacy preprocessing (simple fillna)")
-                from nexusflow.data.ingestion import load_datasets
-                raw_datasets = load_datasets(self.cfg)
-                self.datasets = align_datasets(raw_datasets, self.cfg.primary_key)
-                self.preprocessors = {}
-            
-            # Calculate input dimensions
-            self.input_dims = []
-            for dataset_cfg in self.cfg.datasets:
-                df = self.datasets[dataset_cfg.name]
-                excluded_cols = {self.cfg.primary_key}
+                # For relational data, we now have a single flattened dataset
+                flattened_dataset = list(self.datasets.values())[0]
+                
+                # Calculate input dimensions from flattened data
+                excluded_cols = set()
                 target_col = self.cfg.target.get('target_column')
-                if target_col and target_col in df.columns:
+                if target_col and target_col in flattened_dataset.columns:
                     excluded_cols.add(target_col)
                 
-                feature_cols = [col for col in df.columns if col not in excluded_cols]
-                self.input_dims.append(len(feature_cols))
+                feature_cols = [col for col in flattened_dataset.columns if col not in excluded_cols]
+                self.input_dims = [len(feature_cols)]  # Single flattened input
+                
+                logger.info(f"   Flattened relational data: {len(feature_cols)} total features")
+                
+            else:
+                # Fallback to legacy preprocessing with relational flattening
+                logger.info("Using relational data with simple preprocessing")
+                from nexusflow.data.ingestion import load_datasets
+                raw_datasets = {}
+                for dataset_cfg in self.cfg.datasets:
+                    path = f"datasets/{dataset_cfg.name}"
+                    df = load_table(path)
+                    raw_datasets[dataset_cfg.name] = df
+                
+                # Apply relational flattening
+                flattened_df = flatten_relational_data(raw_datasets, self.cfg)
+                self.datasets = {self.cfg.datasets[0].name: flattened_df}
+                self.preprocessors = {}
+                
+                # Calculate dimensions
+                excluded_cols = set()
+                target_col = self.cfg.target.get('target_column')
+                if target_col and target_col in flattened_df.columns:
+                    excluded_cols.add(target_col)
+                
+                feature_cols = [col for col in flattened_df.columns if col not in excluded_cols]
+                self.input_dims = [len(feature_cols)]
             
             # Enhanced data quality reporting
             total_samples = len(list(self.datasets.values())[0]) if self.datasets else 0
             total_features = sum(self.input_dims)
             
-            logger.info(f"📈 Data pipeline complete:")
-            logger.info(f"   Aligned samples: {total_samples:,}")
-            logger.info(f"   Datasets: {len(self.datasets)}")
-            logger.info(f"   Feature dimensions: {self.input_dims}")
-            logger.info(f"   Total features: {total_features}")
+            logger.info(f"📈 Relational data pipeline complete:")
+            logger.info(f"   Final samples: {total_samples:,}")
+            logger.info(f"   Flattened features: {total_features}")
+            logger.info(f"   Original datasets: {len(self.cfg.datasets)}")
             logger.info(f"   Preprocessing: {'advanced' if self.preprocessors else 'legacy'}")
 
     def _initialize_preprocessing_aware_model(self):
@@ -710,27 +722,27 @@ class Trainer:
         logger.info(f"Enhanced model saved: {path}")
 
     def _create_enhanced_model_artifact(self, path: Path):
-        """Create enhanced .nxf model artifact with Phase 2 preprocessing."""
+        """Create enhanced .nxf model artifact with relational data support."""
         if self.best_model_state is None:
             logger.warning("No trained model to create artifact from")
             return
         
         # Create enhanced model instance
-        embed_dim = self.cfg.architecture.global_embed_dim  # Direct attribute access
-        refinement_iterations = self.cfg.architecture.refinement_iterations  # Direct attribute access
+        embed_dim = self.cfg.architecture.global_embed_dim
+        refinement_iterations = self.cfg.architecture.refinement_iterations
         
         model = NexusFormer(
             input_dims=self.input_dims,
             embed_dim=embed_dim,
             refinement_iterations=refinement_iterations,
             encoder_type=getattr(self.model, 'encoder_type', 'standard'),
-            use_moe=self.cfg.architecture.use_moe,  # Direct attribute access
-            num_experts=self.cfg.architecture.num_experts,  # Direct attribute access
-            use_flash_attn=self.cfg.architecture.use_flash_attn  # Direct attribute access
+            use_moe=self.cfg.architecture.use_moe,
+            num_experts=self.cfg.architecture.num_experts,
+            use_flash_attn=self.cfg.architecture.use_flash_attn
         )
         model.load_state_dict(self.best_model_state)
         
-        # Enhanced metadata with preprocessing information
+        # Enhanced metadata with relational and preprocessing information
         meta = {
             'config': self.cfg.model_dump() if hasattr(self.cfg, 'model_dump') else dict(self.cfg),
             'input_dims': self.input_dims,
@@ -738,9 +750,16 @@ class Trainer:
             'best_epoch': self.best_epoch,
             'model_class': 'NexusFormer',
             'training_complete': True,
+            'relational_features': {
+                'relational_data_support': True,
+                'original_datasets': len(self.cfg.datasets),
+                'flattened_features': sum(self.input_dims),
+                'join_relationships': len([fk for ds in self.cfg.datasets for fk in (ds.foreign_keys or [])]),
+                'preprocessing_metadata': self.preprocessing_metadata
+            },
             'phase_2_features': {
                 'advanced_preprocessing': bool(self.preprocessors),
-                'preprocessing_metadata': self.preprocessing_metadata,
+                'relational_joins': True,
                 'preprocessor_datasets': list(self.preprocessors.keys()) if self.preprocessors else []
             },
             'architecture_features': {
@@ -750,24 +769,67 @@ class Trainer:
                 'use_flash_attn': self.cfg.architecture.use_flash_attn,
                 'refinement_iterations': refinement_iterations,
                 'embed_dim': embed_dim
-            },
-            'performance_metrics': {
-                'best_metric': self.best_val_metric,
-                'total_epochs': len(self.training_history),
-                'parameters': sum(p.numel() for p in model.parameters())
             }
         }
         
-        # Include preprocessors in the artifact
+        # Include preprocessors and relational schema
         if self.preprocessors:
             meta['preprocessors'] = self.preprocessors
+            meta['relational_schema'] = {
+                'datasets': [ds.dict() for ds in self.cfg.datasets],
+                'target_table': self.cfg.target.get('target_table'),
+                'join_order': [ds.name for ds in self.cfg.datasets]
+            }
         
         # Create enhanced ModelAPI instance
         model_api = ModelAPI(model, preprocess_meta=meta)
         model_api.save(str(path))
         
-        logger.info(f"🎁 Phase 2 enhanced model artifact created: {path}")
-        logger.info(f"   Includes: {'advanced preprocessing' if self.preprocessors else 'legacy preprocessing'}")
+        logger.info(f"🎁 Relational model artifact created: {path}")
+        logger.info(f"   Features: relational joins, {'advanced preprocessing' if self.preprocessors else 'simple preprocessing'}")
+        logger.info(f"   Original datasets: {len(self.cfg.datasets)}, Final features: {sum(self.input_dims)}")
+
+    def _validate_relational_data_at_inference(self, new_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        Validate and process new relational data for inference.
+        
+        This function ensures new data follows the same relational schema
+        and applies the same joins and preprocessing as during training.
+        """
+        logger.info("🔍 Validating relational data for inference...")
+        
+        # Check that all required tables are present
+        required_tables = [ds.name for ds in self.cfg.datasets]
+        provided_tables = list(new_data.keys())
+        
+        missing_tables = set(required_tables) - set(provided_tables)
+        if missing_tables:
+            raise ValueError(f"Missing required tables for inference: {missing_tables}")
+        
+        # Apply the same relational flattening as during training
+        flattened_df = flatten_relational_data(new_data, self.cfg)
+        
+        # Apply same preprocessing if available
+        if self.preprocessors:
+            preprocessor = list(self.preprocessors.values())[0]  # We have one preprocessor for flattened data
+            
+            target_col = self.cfg.target.get('target_column')
+            feature_df = flattened_df.copy()
+            if target_col and target_col in feature_df.columns:
+                feature_df = feature_df.drop(columns=[target_col])
+            
+            processed_features = preprocessor.transform(feature_df)
+            
+            # Reconstruct with target if present
+            final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+            processed_df = processed_features[final_cols].copy()
+            
+            if target_col and target_col in flattened_df.columns:
+                processed_df[target_col] = flattened_df[target_col]
+            
+            return processed_df
+        
+        return flattened_df
 
     def evaluate(self) -> Dict[str, float]:
         """Enhanced evaluation with Phase 2 preprocessing metrics."""
