@@ -120,6 +120,11 @@ class NexusFlowModelArtifact:
                 raise KeyError(f"Required dataset '{dataset_name}' not found in input data")
             
             df = data[dataset_name].copy()
+
+            # --- FIX: Convert datetime columns to numeric before processing ---
+            for col in df.select_dtypes(include=['datetime64[ns]']).columns:
+                logger.info(f"Converting datetime column '{col}' to numeric timestamp.")
+                df[col] = df[col].astype(np.int64) // 10**9 # Convert to seconds since epoch
             
             # Apply preprocessing if available
             if dataset_name in self.preprocessors:
