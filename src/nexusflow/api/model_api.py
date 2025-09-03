@@ -21,29 +21,20 @@ class NexusFlowModelArtifact:
             model: Trained NexusFormer model (must be torch.nn.Module)
             preprocess_meta: Metadata including config, input dimensions, training info
         """
-        # Add type checking to prevent nested artifacts
         if not isinstance(model, torch.nn.Module):
-            raise TypeError(f"Expected torch.nn.Module, got {type(model)}. "
-                        f"If passing a NexusFlowModelArtifact, use artifact.model instead.")
+            raise TypeError(f"Expected torch.nn.Module, got {type(model)}.")
         
         self.model = model
-        self.model.eval()  # Always in eval mode for inference
+        self.model.eval()
         self.meta = preprocess_meta
         
-        # Extract key information from metadata
         self.config = preprocess_meta.get('config', {})
         self.input_dims = preprocess_meta.get('input_dims', [])
-        self.primary_key = self.config.get('primary_key', 'id')
-        self.target_info = self.config.get('target', {})
         self.datasets_config = self.config.get('datasets', [])
-        
-        # Extract preprocessors if available
         self.preprocessors = preprocess_meta.get('preprocessors', {})
+        self.device = torch.device('cpu')
         
-        # Device management
-        self.device = torch.device('cpu')  # Default to CPU for artifacts
-        
-        logger.info(f"NexusFlow model artifact initialized with {len(self.input_dims)} input dimensions")
+        logger.info(f"NexusFlow model artifact initialized. Expecting {len(self.input_dims)} feature groups.")
         if self.preprocessors:
             logger.info(f"Preprocessors available for: {list(self.preprocessors.keys())}")
     
@@ -60,33 +51,31 @@ class NexusFlowModelArtifact:
         Returns:
             numpy array of predictions
         """
+    def predict(self, data: Dict[str, pd.DataFrame]) -> np.ndarray:
+        """
+        Make predictions on new, raw relational data.
+        """
         logger.info("Making predictions on new data...")
         
-        # Convert input to standardized format
-        feature_tensors = self._preprocess_input(data)
+        feature_tensors = self._preprocess_input_relational(data)
         
-        # Validate input dimensions
         if len(feature_tensors) != len(self.input_dims):
-            raise ValueError(f"Expected {len(self.input_dims)} feature groups, got {len(feature_tensors)}")
+            raise ValueError(f"Expected {len(self.input_dims)} feature groups after processing, got {len(feature_tensors)}")
         
         for i, (tensor, expected_dim) in enumerate(zip(feature_tensors, self.input_dims)):
             if tensor.size(-1) != expected_dim:
                 raise ValueError(f"Feature group {i} has {tensor.size(-1)} features, expected {expected_dim}")
         
-        # Run inference
         self.model.eval()
         with torch.no_grad():
             predictions = self.model(feature_tensors)
         
-        # Convert to numpy and apply post-processing based on task type
         predictions_np = predictions.cpu().numpy()
         
-        # Apply task-specific post-processing
-        target_col = self.target_info.get('target_column', 'label')
-        if target_col == 'label':
-            # Classification: apply sigmoid for binary classification
-            predictions_np = 1 / (1 + np.exp(-predictions_np))  # sigmoid
-        
+        # Apply sigmoid for binary classification probabilities
+        if self.config.get('target', {}).get('target_column') == 'late_delivery': # Simple check
+             predictions_np = 1 / (1 + np.exp(-predictions_np))
+
         logger.info(f"Generated {len(predictions_np)} predictions")
         return predictions_np
     
@@ -324,6 +313,48 @@ class NexusFlowModelArtifact:
             
             start_idx = end_idx
         
+        return feature_tensors
+    
+    def _preprocess_input_relational(self, data: Dict[str, pd.DataFrame]) -> List[torch.Tensor]:
+        """
+        Replicates the entire training data pipeline: flattens relational data,
+        logically splits it, and applies saved preprocessors.
+        """
+        # Step 1: Flatten the raw relational data using the stored config.
+        flattened_df = _flatten_relational_data_for_prediction(data, self.config)
+
+        # Step 2: Logically split, preprocess, and create tensors for each feature group.
+        feature_tensors = []
+        for i, dataset_cfg_dict in enumerate(self.datasets_config):
+            dataset_name = dataset_cfg_dict['name']
+            preprocessor = self.preprocessors.get(dataset_name)
+
+            if not preprocessor:
+                logger.error(f"FATAL: Saved preprocessor for '{dataset_name}' not found in model artifact.")
+                raise RuntimeError(f"Missing preprocessor for {dataset_name}")
+            
+            # Identify the feature columns for this logical group from the preprocessor
+            feature_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+            
+            # Ensure all expected columns exist in the flattened df, filling missing with NaN
+            # This handles cases where an order might not have associated items, for example.
+            df_subset = pd.DataFrame(columns=feature_cols, index=flattened_df.index)
+            for col in feature_cols:
+                 if col in flattened_df.columns:
+                      df_subset[col] = flattened_df[col]
+
+            # Apply the saved preprocessor
+            processed_df = preprocessor.transform(df_subset)
+            
+            # Verify the number of features matches the model's expectation for this input
+            if processed_df.shape[1] != self.input_dims[i]:
+                raise ValueError(f"Mismatch for '{dataset_name}': Preprocessor output {processed_df.shape[1]} columns, but model expects {self.input_dims[i]}.")
+
+            # Convert to tensor
+            tensor = torch.tensor(processed_df.values.astype(np.float32))
+            feature_tensors.append(tensor)
+            logger.info(f"Processed logical group '{dataset_name}': {tensor.shape}")
+
         return feature_tensors
     
     def get_params(self) -> Dict[str, Any]:
@@ -697,3 +728,64 @@ def load_model(path: str) -> NexusFlowModelArtifact:
         NexusFlowModelArtifact instance ready for inference
     """
     return ModelAPI.load(path)
+
+def _flatten_relational_data_for_prediction(raw_datasets: Dict[str, pd.DataFrame], cfg: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Flattens a relational schema for prediction, anchored on the target table samples.
+    """
+    logger.info("... Flattening relational data for prediction ...")
+    target_table_name = cfg['target']['target_table']
+    
+    # The base DataFrame is the sample of data we want to predict on.
+    base_df = raw_datasets[target_table_name].copy()
+
+    dataset_configs = {d['name']: d for d in cfg['datasets']}
+
+    # --- Direct Joins (Many-to-One, e.g., orders -> customers) ---
+    customers_df = raw_datasets.get("customers.csv")
+    if customers_df is not None:
+        customer_fk = next((fk for fk in dataset_configs["customers.csv"].get('foreign_keys', []) if fk['references_table'] == target_table_name), None)
+        if customer_fk:
+            logger.info(f"Joining customers.csv on '{customer_fk['columns']}'")
+            base_df = pd.merge(base_df, customers_df, left_on=customer_fk['references_columns'], right_on=customer_fk['columns'], how='left')
+
+    # --- Aggregation for One-to-Many Relationships (e.g., order_items -> orders) ---
+    order_items_df = raw_datasets.get("order_items.csv")
+    products_df = raw_datasets.get("products.csv")
+
+    if order_items_df is not None:
+        items_cfg = dataset_configs["order_items.csv"]
+        
+        # Enrich order_items with product info
+        if products_df is not None:
+            product_fk = next((fk for fk in items_cfg.get('foreign_keys', []) if fk['references_table'] == "products.csv"), None)
+            if product_fk:
+                logger.info(f"Enriching order_items with product data on '{product_fk['columns']}'")
+                order_items_df = pd.merge(order_items_df, products_df, left_on=product_fk['columns'], right_on=product_fk['references_columns'], how='left')
+
+        order_fk = next((fk for fk in items_cfg.get('foreign_keys', []) if fk['references_table'] == target_table_name), None)
+        if order_fk:
+            join_key = order_fk['columns']
+            # We only need to aggregate for the orders we are predicting on
+            relevant_items = order_items_df[order_items_df[join_key].isin(base_df[order_fk['references_columns']])]
+
+            aggregations = {
+                'price': ['mean', 'sum', 'max', 'std'],
+                'freight_value': ['mean', 'sum'],
+                'product_weight_g': ['mean', 'sum', 'std'],
+                'product_category_name': ['nunique', lambda x: x.mode()[0] if not x.empty else 'unknown'],
+                'order_item_id': ['count']
+            }
+            
+            valid_aggregations = {col: funcs for col, funcs in aggregations.items() if col in relevant_items.columns}
+            
+            if valid_aggregations:
+                logger.info(f"Aggregating item data for {len(base_df)} orders.")
+                aggregated_df = relevant_items.groupby(join_key).agg(valid_aggregations)
+                aggregated_df.columns = ['agg_' + '_'.join(col).strip() for col in aggregated_df.columns.values]
+                aggregated_df = aggregated_df.reset_index()
+                
+                base_df = pd.merge(base_df, aggregated_df, left_on=order_fk['references_columns'], right_on=join_key, how='left')
+
+    logger.info(f"Prediction data flattened. Shape: {base_df.shape}")
+    return base_df
