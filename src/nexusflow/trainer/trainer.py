@@ -11,7 +11,7 @@ import time
 
 from nexusflow.config import ConfigModel
 from nexusflow.model.nexus_former import NexusFormer
-from nexusflow.data.ingestion import load_and_preprocess_datasets, make_dataloaders, flatten_relational_data, load_table
+from nexusflow.data.ingestion import load_and_preprocess_datasets, make_dataloaders, flatten_relational_data, load_table, align_datasets
 from nexusflow.data.preprocessor import TabularPreprocessor
 from nexusflow.api.model_api import ModelAPI
 
@@ -155,7 +155,7 @@ class Trainer:
         self.mlops_logger.log_architecture_stats(self.model, self.cfg)
 
     def _setup_enhanced_data(self):
-        """Enhanced data setup with relational data support."""
+        """Enhanced data setup with RESTORED multi-table support."""
         training_cfg = self.cfg.training
         
         if training_cfg.use_synthetic:
@@ -169,60 +169,69 @@ class Trainer:
             logger.info(f"   Synthetic data: {n_datasets} datasets × {feature_dim} features")
             
         else:
-            logger.info("📊 Loading datasets with relational data support...")
+            logger.info("📊 Loading datasets with RESTORED multi-table support...")
             
-            # Use relational preprocessing pipeline
+            # RESTORED: Use multi-table preprocessing pipeline (no flattening)
             if training_cfg.use_advanced_preprocessing:
                 self.datasets, self.preprocessors = load_and_preprocess_datasets(self.cfg)
-                logger.info(f"✅ Relational preprocessing applied to {len(self.preprocessors)} dataset(s)")
+                logger.info(f"✅ Multi-table preprocessing applied to {len(self.preprocessors)} dataset(s)")
                 
-                # For relational data, we now have a single flattened dataset
-                flattened_dataset = list(self.datasets.values())[0]
-                
-                # Calculate input dimensions from flattened data
-                excluded_cols = set()
-                target_col = self.cfg.target.get('target_column')
-                if target_col and target_col in flattened_dataset.columns:
-                    excluded_cols.add(target_col)
-                
-                feature_cols = [col for col in flattened_dataset.columns if col not in excluded_cols]
-                self.input_dims = [len(feature_cols)]  # Single flattened input
-                
-                logger.info(f"   Flattened relational data: {len(feature_cols)} total features")
+                # Calculate input dimensions for each separate dataset
+                self.input_dims = []
+                for dataset_cfg in self.cfg.datasets:
+                    dataset_name = dataset_cfg.name
+                    if dataset_name in self.datasets:
+                        df = self.datasets[dataset_name]
+                        
+                        # Calculate features for this specific dataset
+                        excluded_cols = {self.cfg.primary_key}
+                        target_col = self.cfg.target.get('target_column')
+                        if target_col and target_col in df.columns:
+                            excluded_cols.add(target_col)
+                        
+                        feature_cols = [col for col in df.columns if col not in excluded_cols]
+                        self.input_dims.append(len(feature_cols))
+                        
+                        logger.info(f"   Dataset {dataset_name}: {len(feature_cols)} features")
                 
             else:
-                # Fallback to legacy preprocessing with relational flattening
-                logger.info("Using relational data with simple preprocessing")
-                from nexusflow.data.ingestion import load_datasets
+                # Fallback to legacy preprocessing but keep multi-table structure
+                logger.info("Using multi-table data with simple preprocessing")
                 raw_datasets = {}
                 for dataset_cfg in self.cfg.datasets:
                     path = f"datasets/{dataset_cfg.name}"
                     df = load_table(path)
                     raw_datasets[dataset_cfg.name] = df
                 
-                # Apply relational flattening
-                flattened_df = flatten_relational_data(raw_datasets, self.cfg)
-                self.datasets = {self.cfg.datasets[0].name: flattened_df}
+                # Use align_datasets instead of flattening
+                self.datasets = align_datasets(raw_datasets, self.cfg.primary_key)
                 self.preprocessors = {}
                 
-                # Calculate dimensions
-                excluded_cols = set()
-                target_col = self.cfg.target.get('target_column')
-                if target_col and target_col in flattened_df.columns:
-                    excluded_cols.add(target_col)
-                
-                feature_cols = [col for col in flattened_df.columns if col not in excluded_cols]
-                self.input_dims = [len(feature_cols)]
+                # Calculate dimensions for each aligned dataset
+                self.input_dims = []
+                for dataset_cfg in self.cfg.datasets:
+                    dataset_name = dataset_cfg.name
+                    if dataset_name in self.datasets:
+                        df = self.datasets[dataset_name]
+                        
+                        excluded_cols = {self.cfg.primary_key}
+                        target_col = self.cfg.target.get('target_column')
+                        if target_col and target_col in df.columns:
+                            excluded_cols.add(target_col)
+                        
+                        feature_cols = [col for col in df.columns if col not in excluded_cols]
+                        self.input_dims.append(len(feature_cols))
             
             # Enhanced data quality reporting
             total_samples = len(list(self.datasets.values())[0]) if self.datasets else 0
             total_features = sum(self.input_dims)
             
-            logger.info(f"📈 Relational data pipeline complete:")
-            logger.info(f"   Final samples: {total_samples:,}")
-            logger.info(f"   Flattened features: {total_features}")
-            logger.info(f"   Original datasets: {len(self.cfg.datasets)}")
-            logger.info(f"   Preprocessing: {'advanced' if self.preprocessors else 'legacy'}")
+            logger.info(f"📈 Multi-table data pipeline complete:")
+            logger.info(f"   Samples per table: {total_samples:,}")
+            logger.info(f"   Feature dimensions: {self.input_dims}")
+            logger.info(f"   Total features: {total_features}")
+            logger.info(f"   Separate datasets: {len(self.cfg.datasets)}")
+            logger.info(f"   Preprocessing: {'advanced' if self.preprocessors else 'simple'}")
 
     def _initialize_preprocessing_aware_model(self):
         """Initialize model with preprocessing awareness."""

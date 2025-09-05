@@ -42,23 +42,30 @@ class NexusFlowDataset(Dataset):
         """
         Returns features and target for a single sample.
         
-        If this is a multi-table dataset (has feature_dimensions), returns a list of tensors.
-        Otherwise returns a single tensor (backwards compatible).
+        RESTORED: If this is a multi-table dataset, returns a LIST of tensors (one per table).
+        This is critical for the multi-agent architecture.
         """
         row = self.df.iloc[idx]
         features = torch.tensor(row[self.feature_cols].values.astype('float32'))
         target = torch.tensor(row[self.target_col], dtype=self.target_dtype)
         
-        # If we have multi-table metadata, split features into separate tensors
+        # Split features back into separate tensors using feature_dimensions
         if self.feature_dimensions is not None:
             feature_list = []
             start_idx = 0
+            
+            # Split the wide feature vector back into separate table tensors
             for dim in self.feature_dimensions:
                 end_idx = start_idx + dim
-                feature_list.append(features[start_idx:end_idx])
+                # Each tensor represents features from one original table
+                table_features = features[start_idx:end_idx]
+                feature_list.append(table_features)
                 start_idx = end_idx
+            
+            # Return LIST of tensors - this is what NexusFormer expects
             return feature_list, target
         
+        # Fallback for single-table datasets
         return features, target
 
 class MultiTableDataLoader:

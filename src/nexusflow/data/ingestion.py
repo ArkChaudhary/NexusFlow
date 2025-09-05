@@ -55,9 +55,10 @@ def validate_primary_key(df: pd.DataFrame, key: str) -> bool:
 
 def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFrame], Dict[str, TabularPreprocessor]]:
     """
-    Enhanced dataset loading with relational data support and preprocessing pipeline.
+    Load datasets with multi-table support and individual preprocessing.
+    RESTORED: No flattening - maintains separate tables for multi-agent architecture.
     """
-    logger.info("🔄 Loading datasets with relational support and preprocessing...")
+    logger.info("🔄 Loading datasets with multi-table support...")
     
     raw_datasets = {}
     preprocessors = {}
@@ -78,71 +79,82 @@ def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFra
         
         raw_datasets[dataset_cfg.name] = df
     
-    # Apply relational flattening instead of simple alignment
-    flattened_df = flatten_relational_data(raw_datasets, cfg)
-    
-    # For backward compatibility, create datasets dict with the flattened result
-    # This maintains the existing function signature
-    aligned_datasets = {cfg.datasets[0].name: flattened_df}  # Use first dataset name as key
+    # Use align_datasets instead of flatten_relational_data
+    aligned_datasets = align_datasets(raw_datasets, cfg.primary_key)
     
     if not cfg.training.use_advanced_preprocessing:
         logger.info("Using simple preprocessing (fillna)")
         return aligned_datasets, {}
     
-    # Apply preprocessing to the flattened dataset
-    logger.info("Applying advanced preprocessing to flattened relational data...")
+    # Apply preprocessing to each aligned DataFrame individually
+    logger.info("Applying individual preprocessing to each aligned dataset...")
+    processed_datasets = {}
     
-    dataset_cfg = cfg.datasets[0]  # Use first dataset config for preprocessing settings
-    df = flattened_df
-    
-    preprocessor = TabularPreprocessor()
-    
-    # Exclude target column from preprocessing
-    target_col = cfg.target.get('target_column')
-    feature_df = df.copy()
-    if target_col and target_col in feature_df.columns:
-        feature_df = feature_df.drop(columns=[target_col])
-    
-    # Combine categorical/numerical columns from all datasets
-    all_categorical = []
-    all_numerical = []
-    
-    for ds_cfg in cfg.datasets:
-        if ds_cfg.categorical_columns:
-            all_categorical.extend(ds_cfg.categorical_columns)
-        if ds_cfg.numerical_columns:
-            all_numerical.extend(ds_cfg.numerical_columns)
-    
-    # Filter to only columns that exist in flattened data
-    existing_categorical = [col for col in all_categorical if col in feature_df.columns]
-    existing_numerical = [col for col in all_numerical if col in feature_df.columns]
-    
-    # Auto-detect remaining columns if enabled
-    if cfg.training.auto_detect_types:
-        remaining_cols = [col for col in feature_df.columns 
-                         if col not in existing_categorical and col not in existing_numerical]
+    for dataset_cfg in cfg.datasets:
+        dataset_name = dataset_cfg.name
+        if dataset_name not in aligned_datasets:
+            continue
+            
+        df = aligned_datasets[dataset_name]
         
-        for col in remaining_cols:
-            if feature_df[col].dtype in ['object', 'category', 'bool']:
-                existing_categorical.append(col)
-            elif pd.api.types.is_numeric_dtype(feature_df[col]):
-                existing_numerical.append(col)
+        # Create individual preprocessor for this dataset
+        preprocessor = TabularPreprocessor()
+        
+        # Exclude target column and primary key from preprocessing
+        target_col = cfg.target.get('target_column')
+        feature_df = df.copy()
+        excluded_cols = {cfg.primary_key}
+        if target_col and target_col in feature_df.columns:
+            excluded_cols.add(target_col)
+        
+        # Remove excluded columns for preprocessing
+        for col in excluded_cols:
+            if col in feature_df.columns:
+                feature_df = feature_df.drop(columns=[col])
+        
+        # Get categorical/numerical columns for this specific dataset
+        categorical_cols = dataset_cfg.categorical_columns or []
+        numerical_cols = dataset_cfg.numerical_columns or []
+        
+        # Filter to only columns that exist in this dataset's feature_df
+        existing_categorical = [col for col in categorical_cols if col in feature_df.columns]
+        existing_numerical = [col for col in numerical_cols if col in feature_df.columns]
+        
+        # Auto-detect remaining columns if enabled
+        if cfg.training.auto_detect_types:
+            remaining_cols = [col for col in feature_df.columns 
+                             if col not in existing_categorical and col not in existing_numerical]
+            
+            for col in remaining_cols:
+                if feature_df[col].dtype in ['object', 'category', 'bool']:
+                    existing_categorical.append(col)
+                elif pd.api.types.is_numeric_dtype(feature_df[col]):
+                    existing_numerical.append(col)
+        
+        # Fit and transform this dataset individually
+        if existing_categorical or existing_numerical:
+            preprocessor.fit(feature_df, existing_categorical, existing_numerical)
+            processed_features = preprocessor.transform(feature_df)
+            
+            # Reconstruct dataset with processed features + excluded columns
+            final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+            processed_df = processed_features[final_cols].copy()
+            
+            # Add back excluded columns
+            for col in excluded_cols:
+                if col in df.columns:
+                    processed_df[col] = df[col]
+            
+            processed_datasets[dataset_name] = processed_df
+            preprocessors[dataset_name] = preprocessor
+            
+            logger.info(f"✅ Processed {dataset_name}: {len(final_cols)} features")
+        else:
+            # No features to process, keep original
+            processed_datasets[dataset_name] = df
+            logger.info(f"⚠️ No features to process in {dataset_name}")
     
-    # Fit and transform
-    preprocessor.fit(feature_df, existing_categorical, existing_numerical)
-    processed_features = preprocessor.transform(feature_df)
-    
-    # Reconstruct final dataset
-    final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
-    processed_df = processed_features[final_cols].copy()
-    
-    if target_col and target_col in df.columns:
-        processed_df[target_col] = df[target_col]
-    
-    processed_datasets = {cfg.datasets[0].name: processed_df}
-    preprocessors = {cfg.datasets[0].name: preprocessor}
-    
-    logger.info("🎯 Relational preprocessing complete")
+    logger.info("🎯 Multi-table preprocessing complete - datasets remain separate")
     return processed_datasets, preprocessors
 
 def align_datasets(datasets: Dict[str, pd.DataFrame], primary_key: str) -> Dict[str, pd.DataFrame]:
@@ -192,20 +204,13 @@ def align_datasets(datasets: Dict[str, pd.DataFrame], primary_key: str) -> Dict[
     return aligned_datasets
 
 def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame], 
-                                       preprocessors: Dict[str, TabularPreprocessor],
-                                       cfg: ConfigModel) -> Tuple[NexusFlowDataset, Dict[str, Any]]:
+                               preprocessors: Dict[str, TabularPreprocessor],
+                               cfg: ConfigModel) -> Tuple[NexusFlowDataset, Dict[str, Any]]:
     """
-    Create enhanced multi-table dataset with preprocessing metadata.
-    
-    Args:
-        datasets: Aligned and preprocessed datasets
-        preprocessors: Fitted preprocessors for each dataset
-        cfg: Configuration object
-        
-    Returns:
-        Tuple of (enhanced_dataset, preprocessing_metadata)
+    Create multi-table dataset that preserves separate table structure.
+    RESTORED: Creates feature dimension mapping for proper tensor splitting.
     """
-    logger.info("Creating enhanced multi-table dataset...")
+    logger.info("Creating multi-table dataset with preserved table boundaries...")
     
     # Find the target table and column
     target_table_name = cfg.target['target_table']
@@ -218,9 +223,9 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
     if target_column not in target_df.columns:
         raise KeyError(f"Target column '{target_column}' not found in target table")
     
-    # Combine all features with preprocessing metadata
+    # Combine features while tracking dimensions for each dataset
     combined_data = []
-    feature_start_indices = []
+    feature_dimensions = []  # This is the key mapping for tensor splitting
     preprocessing_metadata = {
         'dataset_order': [],
         'feature_dimensions': [],
@@ -228,7 +233,6 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
         'column_mappings': {}
     }
     
-    current_idx = 0
     for dataset_config in cfg.datasets:
         dataset_name = dataset_config.name
         df = datasets[dataset_name]
@@ -241,10 +245,11 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
         feature_cols = [col for col in df.columns if col not in excluded_cols]
         
         if feature_cols:
-            feature_start_indices.append(current_idx)
+            # Store the feature dimension for this dataset
+            feature_dimensions.append(len(feature_cols))
             combined_data.append(df[feature_cols])
             
-            # Store preprocessing metadata
+            # Store metadata
             preprocessing_metadata['dataset_order'].append(dataset_name)
             preprocessing_metadata['feature_dimensions'].append(len(feature_cols))
             
@@ -259,15 +264,14 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
                     'transformer_type': dataset_config.transformer_type
                 }
                 
-                # Create column mapping for tokenizer
                 preprocessing_metadata['column_mappings'][dataset_name] = {
                     'categorical': [col for col in feature_cols if col in feature_info['categorical_columns']],
                     'numerical': [col for col in feature_cols if col in feature_info['numerical_columns']]
                 }
             
-            current_idx += len(feature_cols)
+            logger.info(f"📊 Dataset {dataset_name}: {len(feature_cols)} features")
     
-    # Combine all features horizontally
+    # Combine all features horizontally (this creates the wide format)
     if combined_data:
         combined_features = pd.concat(combined_data, axis=1)
     else:
@@ -276,12 +280,11 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
     # Add target column
     combined_features[target_column] = target_df[target_column]
     
-    # Create the enhanced dataset
+    # Create the dataset
     dataset = NexusFlowDataset(combined_features, target_col=target_column)
     
-    # Store enhanced metadata
-    dataset.feature_start_indices = feature_start_indices
-    dataset.feature_dimensions = preprocessing_metadata['feature_dimensions']
+    # CRITICAL: Store the feature dimensions for tensor splitting
+    dataset.feature_dimensions = feature_dimensions
     dataset.preprocessing_metadata = preprocessing_metadata
     
     # Enhanced attributes for advanced transformers
@@ -289,97 +292,80 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
     dataset.complexities = [d.complexity for d in cfg.datasets]
     dataset.context_weights = [d.context_weight for d in cfg.datasets]
     
-    logger.info(f"Enhanced dataset created:")
-    logger.info(f"  Total features: {sum(preprocessing_metadata['feature_dimensions'])}")
+    logger.info(f"Multi-table dataset created:")
+    logger.info(f"  Total features: {sum(feature_dimensions)}")
+    logger.info(f"  Dataset dimensions: {feature_dimensions}")
     logger.info(f"  Datasets: {len(preprocessing_metadata['dataset_order'])}")
-    logger.info(f"  Preprocessing: {'enabled' if preprocessors else 'disabled'}")
     
     return dataset, preprocessing_metadata
 
 def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame], 
-                            preprocessors: Dict[str, TabularPreprocessor] = None):
+                     preprocessors: Dict[str, TabularPreprocessor] = None):
     """
-    Create enhanced dataloaders with relational data support.
-    
-    Args:
-        cfg: Configuration object
-        datasets: Processed datasets (now contains flattened relational data)
-        preprocessors: Fitted preprocessors (optional)
-        
-    Returns:
-        Tuple of (train_loader, val_loader, test_loader, preprocessing_metadata)
+    Create dataloaders with multi-table support.
+    RESTORED: Uses create_multi_table_dataset to maintain separate table structure.
     """
-    logger.info("Creating dataloaders for relational data...")
+    logger.info("Creating dataloaders for multi-table data...")
     
-    # For relational data, we have a single flattened dataset
-    reference_df = list(datasets.values())[0]
+    # Use the restored multi-table dataset creation
+    dataset, preprocessing_metadata = create_multi_table_dataset(
+        datasets, preprocessors or {}, cfg
+    )
     
-    # Split indices
+    # Split indices from the combined dataset
+    combined_df = dataset.df
     train_indices, val_indices, test_indices = split_df(
-        reference_df,
+        combined_df,
         test_size=cfg.training.split_config.test_size,
         val_size=cfg.training.split_config.validation_size,
         randomize=cfg.training.split_config.randomize,
     )
     
-    # Split the flattened dataset
-    train_df = reference_df.iloc[train_indices.index].reset_index(drop=True)
-    val_df = reference_df.iloc[val_indices.index].reset_index(drop=True) if len(val_indices) > 0 else pd.DataFrame()
-    test_df = reference_df.iloc[test_indices.index].reset_index(drop=True)
+    # Create split datasets
+    train_df = combined_df.iloc[train_indices.index].reset_index(drop=True)
+    val_df = combined_df.iloc[val_indices.index].reset_index(drop=True) if len(val_indices) > 0 else pd.DataFrame()
+    test_df = combined_df.iloc[test_indices.index].reset_index(drop=True)
     
-    # Create datasets - treat as single table for dataset creation
     target_column = cfg.target['target_column']
     
+    # Create NexusFlowDataset instances with preserved feature_dimensions
     train_dataset = NexusFlowDataset(train_df, target_col=target_column)
-    val_dataset = NexusFlowDataset(val_df, target_col=target_column) if len(val_df) > 0 else None
+    train_dataset.feature_dimensions = dataset.feature_dimensions  # CRITICAL: Copy the mapping
+    train_dataset.preprocessing_metadata = preprocessing_metadata
+    
+    val_dataset = None
+    if len(val_df) > 0:
+        val_dataset = NexusFlowDataset(val_df, target_col=target_column)
+        val_dataset.feature_dimensions = dataset.feature_dimensions
+        val_dataset.preprocessing_metadata = preprocessing_metadata
+    
     test_dataset = NexusFlowDataset(test_df, target_col=target_column)
+    test_dataset.feature_dimensions = dataset.feature_dimensions
+    test_dataset.preprocessing_metadata = preprocessing_metadata
     
-    # Create preprocessing metadata for relational data
-    preprocessing_metadata = {
-        'relational_data': True,
-        'original_datasets': len(cfg.datasets),
-        'flattened_features': len([col for col in reference_df.columns if col != target_column]),
-        'dataset_order': [cfg.datasets[0].name],  # Single flattened dataset
-        'feature_dimensions': [len([col for col in reference_df.columns if col != target_column])],
-        'preprocessor_info': {},
-        'column_mappings': {}
-    }
-    
-    # Add preprocessor info if available
-    if preprocessors:
-        preprocessor = list(preprocessors.values())[0]
-        feature_info = preprocessor.get_feature_info()
-        
-        preprocessing_metadata['preprocessor_info'][cfg.datasets[0].name] = {
-            'categorical_columns': feature_info['categorical_columns'],
-            'numerical_columns': feature_info['numerical_columns'],
-            'vocab_sizes': feature_info['vocab_sizes'],
-            'transformer_type': 'relational_flattened'
-        }
-        
-        # Set dataset metadata for compatibility
-        train_dataset.feature_dimensions = [len(feature_info['categorical_columns']) + len(feature_info['numerical_columns'])]
-        train_dataset.preprocessing_metadata = preprocessing_metadata
-        
-        if val_dataset:
-            val_dataset.feature_dimensions = train_dataset.feature_dimensions
-            val_dataset.preprocessing_metadata = preprocessing_metadata
-        
-        test_dataset.feature_dimensions = train_dataset.feature_dimensions
-        test_dataset.preprocessing_metadata = preprocessing_metadata
-    
-    # Create DataLoaders
+    # Create DataLoaders with custom collate for multi-table data
     batch_size = cfg.training.batch_size
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    # Use MultiTableDataLoader if we have multi-table data
+    if dataset.feature_dimensions and len(dataset.feature_dimensions) > 1:
+        from nexusflow.data.dataset import MultiTableDataLoader
+        
+        train_loader = MultiTableDataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = MultiTableDataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
+        test_loader = MultiTableDataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        
+        logger.info("🔀 Using MultiTableDataLoader for multi-agent batching")
+    else:
+        # Standard DataLoader for single table
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    logger.info(f"Relational DataLoaders created:")
+    logger.info(f"Multi-table DataLoaders created:")
     logger.info(f"  Train: {len(train_loader)} batches ({len(train_dataset)} samples)")
     logger.info(f"  Val: {len(val_loader) if val_loader else 0} batches ({len(val_dataset) if val_dataset else 0} samples)")
     logger.info(f"  Test: {len(test_loader)} batches ({len(test_dataset)} samples)")
-    logger.info(f"  Relational features: {preprocessing_metadata['flattened_features']} from {preprocessing_metadata['original_datasets']} tables")
+    logger.info(f"  Feature dimensions per table: {dataset.feature_dimensions}")
     
     return train_loader, val_loader, test_loader, preprocessing_metadata
 
