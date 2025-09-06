@@ -1,4 +1,5 @@
 project_name: "nexusflow_churn_prediction"
+primary_key: "user_id"
 
 target:
   target_column: "churn_risk"
@@ -7,29 +8,20 @@ target:
 # Dataset configurations with different transformer types
 datasets:
   - name: "users.csv"
-    primary_key: "user_id"
-    foreign_keys: []  # No foreign keys since this is the main table
     transformer_type: "ft_transformer"  # Feature Tokenizer Transformer for tabular data
     complexity: "medium"
     context_weight: 1.0
     categorical_columns: ["region", "subscription_tier"]
     numerical_columns: ["age", "income", "account_tenure_months", "num_products", "support_tickets"]
-    include_keys_as_features: true
   
   - name: "transactions.csv"
-    primary_key: "user_id"
-    foreign_keys:
-      - columns: "user_id"
-        references_table: "users.csv"
-        references_columns: "user_id"
     transformer_type: "standard"  # Standard transformer with FlashAttention
     complexity: "medium"
     context_weight: 0.8
     categorical_columns: ["payment_method", "transaction_category"]
     numerical_columns: ["transaction_amount", "transaction_frequency", "days_since_last_transaction", "merchant_rating"]
-    include_keys_as_features: true
 
-# Architecture configuration
+# Advanced architecture configuration
 architecture:
   global_embed_dim: 128
   refinement_iterations: 4
@@ -41,23 +33,11 @@ architecture:
 # Training configuration
 training:
   batch_size: 32
-  epochs: 7
-  
+  epochs: 15
   optimizer:
     name: "adam"
     lr: 0.001
     weight_decay: 0.0001
-  
-  split_config:
-    test_size: 0.2
-    validation_size: 0.2
-    randomize: true
-  
-  # Synthetic data options
-  use_synthetic: false
-  synthetic:
-    n_samples: 256
-    feature_dim: 5
   
   # Advanced preprocessing
   use_advanced_preprocessing: true
@@ -67,9 +47,14 @@ training:
   early_stopping: true
   patience: 5
   gradient_clipping: 1.0
+  
+  split_config:
+    test_size: 0.2
+    validation_size: 0.2
+    randomize: true
 
 # MLOps configuration
 mlops:
   logging_provider: "stdout"
   experiment_name: "churn_prediction_demo"
-  log_attention_patterns: false      
+  log_attention_patterns: false
