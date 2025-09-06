@@ -12,6 +12,7 @@ import time
 from nexusflow.config import ConfigModel
 from nexusflow.model.nexus_former import NexusFormer
 from nexusflow.data.ingestion import load_and_preprocess_datasets, make_dataloaders, flatten_relational_data, load_table, align_datasets
+from nexusflow.data.ingestion import RelationalAligner
 from nexusflow.data.preprocessor import TabularPreprocessor
 from nexusflow.api.model_api import ModelAPI
 
@@ -155,7 +156,7 @@ class Trainer:
         self.mlops_logger.log_architecture_stats(self.model, self.cfg)
 
     def _setup_enhanced_data(self):
-        """Enhanced data setup with RESTORED multi-table support."""
+        """Enhanced data setup with RelationalAligner integration."""
         training_cfg = self.cfg.training
         
         if training_cfg.use_synthetic:
@@ -169,69 +170,44 @@ class Trainer:
             logger.info(f"   Synthetic data: {n_datasets} datasets × {feature_dim} features")
             
         else:
-            logger.info("📊 Loading datasets with RESTORED multi-table support...")
+            logger.info("📊 Loading datasets with RelationalAligner...")
             
-            # RESTORED: Use multi-table preprocessing pipeline (no flattening)
+            # Load raw datasets
+            raw_datasets = {}
+            for dataset_cfg in self.cfg.datasets:
+                path = f"datasets/{dataset_cfg.name}"
+                df = load_table(path)
+                raw_datasets[dataset_cfg.name] = df
+            
+            # Use RelationalAligner for sophisticated alignment
+            aligner = RelationalAligner(raw_datasets, self.cfg)
+            self.datasets = aligner.align()
+            
+            # Apply preprocessing if enabled
             if training_cfg.use_advanced_preprocessing:
-                self.datasets, self.preprocessors = load_and_preprocess_datasets(self.cfg)
-                logger.info(f"✅ Multi-table preprocessing applied to {len(self.preprocessors)} dataset(s)")
-                
-                # Calculate input dimensions for each separate dataset
-                self.input_dims = []
+                logger.info("🔧 Applying advanced preprocessing...")
                 for dataset_cfg in self.cfg.datasets:
                     dataset_name = dataset_cfg.name
                     if dataset_name in self.datasets:
-                        df = self.datasets[dataset_name]
-                        
-                        # Calculate features for this specific dataset
-                        excluded_cols = {self.cfg.primary_key}
-                        target_col = self.cfg.target.get('target_column')
-                        if target_col and target_col in df.columns:
-                            excluded_cols.add(target_col)
-                        
-                        feature_cols = [col for col in df.columns if col not in excluded_cols]
-                        self.input_dims.append(len(feature_cols))
-                        
-                        logger.info(f"   Dataset {dataset_name}: {len(feature_cols)} features")
-                
-            else:
-                # Fallback to legacy preprocessing but keep multi-table structure
-                logger.info("Using multi-table data with simple preprocessing")
-                raw_datasets = {}
-                for dataset_cfg in self.cfg.datasets:
-                    path = f"datasets/{dataset_cfg.name}"
-                    df = load_table(path)
-                    raw_datasets[dataset_cfg.name] = df
-                
-                # Use align_datasets instead of flattening
-                self.datasets = align_datasets(raw_datasets, self.cfg.primary_key)
-                self.preprocessors = {}
-                
-                # Calculate dimensions for each aligned dataset
-                self.input_dims = []
-                for dataset_cfg in self.cfg.datasets:
-                    dataset_name = dataset_cfg.name
-                    if dataset_name in self.datasets:
-                        df = self.datasets[dataset_name]
-                        
-                        excluded_cols = {self.cfg.primary_key}
-                        target_col = self.cfg.target.get('target_column')
-                        if target_col and target_col in df.columns:
-                            excluded_cols.add(target_col)
-                        
-                        feature_cols = [col for col in df.columns if col not in excluded_cols]
-                        self.input_dims.append(len(feature_cols))
+                        preprocessor = TabularPreprocessor(dataset_cfg)
+                        self.datasets[dataset_name] = preprocessor.fit_transform(self.datasets[dataset_name])
+                        self.preprocessors[dataset_name] = preprocessor
             
-            # Enhanced data quality reporting
-            total_samples = len(list(self.datasets.values())[0]) if self.datasets else 0
-            total_features = sum(self.input_dims)
+            # Calculate input dimensions
+            self.input_dims = []
+            for dataset_cfg in self.cfg.datasets:
+                dataset_name = dataset_cfg.name
+                if dataset_name in self.datasets:
+                    df = self.datasets[dataset_name]
+                    excluded_cols = {self.cfg.primary_key}
+                    target_col = self.cfg.target.get('target_column')
+                    if target_col and target_col in df.columns:
+                        excluded_cols.add(target_col)
+                    
+                    feature_cols = [col for col in df.columns if col not in excluded_cols]
+                    self.input_dims.append(len(feature_cols))
             
-            logger.info(f"📈 Multi-table data pipeline complete:")
-            logger.info(f"   Samples per table: {total_samples:,}")
-            logger.info(f"   Feature dimensions: {self.input_dims}")
-            logger.info(f"   Total features: {total_features}")
-            logger.info(f"   Separate datasets: {len(self.cfg.datasets)}")
-            logger.info(f"   Preprocessing: {'advanced' if self.preprocessors else 'simple'}")
+            logger.info(f"📈 RelationalAligner complete: {self.input_dims} features per dataset")
 
     def _initialize_preprocessing_aware_model(self):
         """Initialize model with preprocessing awareness."""

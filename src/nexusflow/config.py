@@ -1,5 +1,6 @@
 """Enhanced configuration loader with relational data support for NexusFlow."""
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator
+import pandas as pd
 from typing import List, Dict, Any, Optional, Literal, Union
 import yaml
 from loguru import logger
@@ -22,6 +23,34 @@ class DatasetConfig(BaseModel):
     # Relational data support
     primary_key: Union[str, List[str]]  # Can be composite key
     foreign_keys: Optional[List[ForeignKeyConfig]] = None
+
+    include_keys_as_features: bool = False
+    
+    @field_validator('foreign_keys')
+    @classmethod
+    def validate_foreign_keys_existence(cls, v, info):
+        """Validate that foreign key columns exist in their respective datasets"""
+        if not v:
+            return v
+            
+        # This validator will be called during runtime when datasets are available
+        # The actual DataFrame validation will be handled in RelationalAligner
+        return v
+    
+    def validate_keys_in_dataframes(self, datasets: Dict[str, pd.DataFrame]) -> None:
+        """Runtime validation of foreign keys against actual DataFrames"""
+        if not hasattr(self, 'foreign_keys') or not self.foreign_keys:
+            return
+            
+        for table_name, keys in self.foreign_keys.items():
+            if table_name not in datasets:
+                raise ValueError(f"Table '{table_name}' specified in foreign_keys not found in datasets")
+                
+            df = datasets[table_name]
+            for key in keys:
+                if key not in df.columns:
+                    raise ValueError(f"Foreign key column '{key}' not found in table '{table_name}'. "
+                                   f"Available columns: {list(df.columns)}")
 
 class SyntheticDataConfig(BaseModel):
     """Configuration for synthetic data generation."""

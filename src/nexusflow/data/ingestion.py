@@ -4,12 +4,241 @@ from loguru import logger
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from typing import Dict, Tuple, List, Optional, Any
+from collections import defaultdict, deque
 import os
 import torch
 
 from nexusflow.config import ConfigModel, DatasetConfig
 from nexusflow.data.dataset import NexusFlowDataset
 from nexusflow.data.preprocessor import TabularPreprocessor, FeatureTokenizer, create_column_info_from_preprocessor
+
+class RelationalAligner:
+    """
+    A stateful service that handles complex relational alignment using an "align-by-duplication" strategy.
+    Ensures perfect consistency between training and prediction data shapes.
+    """
+    
+    def __init__(self, datasets: Dict[str, pd.DataFrame], config):
+        self.datasets = datasets.copy()
+        self.config = config
+        self.dependency_graph = {}
+        self.master_table = None
+        self.master_index = None
+        
+        # Validate configuration against actual datasets
+        if hasattr(config, 'validate_keys_in_dataframes'):
+            config.validate_keys_in_dataframes(datasets)
+    
+    def align(self) -> Dict[str, pd.DataFrame]:
+        """
+        Main public method to execute the full alignment process.
+        Returns a dictionary of perfectly aligned DataFrames.
+        """
+        if not self.config.foreign_keys:
+            # No relational structure - return datasets as-is but handle key inclusion
+            return self._handle_key_features(self.datasets)
+        
+        # Build dependency relationships
+        self._build_dependency_graph()
+        
+        # Create master index from the "many-est" table
+        self._create_master_index()
+        
+        # Join and reconstruct all tables
+        aligned_datasets = self._join_and_reconstruct()
+        
+        # Handle key column inclusion/exclusion
+        return self._handle_key_features(aligned_datasets)
+    
+    def _build_dependency_graph(self) -> None:
+        """Build and validate the dependency graph from foreign key relationships"""
+        self.dependency_graph = {}
+        all_tables = set(self.datasets.keys())
+        
+        # Build the graph
+        for table, foreign_keys in self.config.foreign_keys.items():
+            if table not in all_tables:
+                raise ValueError(f"Table '{table}' in foreign_keys not found in datasets")
+            
+            self.dependency_graph[table] = foreign_keys
+        
+        # Validate all tables are connected
+        referenced_tables = set()
+        for fkeys in self.dependency_graph.values():
+            for fkey in fkeys:
+                # Extract referenced table from foreign key (assuming format like 'table.column' or just 'column')
+                if '.' in fkey:
+                    ref_table = fkey.split('.')[0]
+                    referenced_tables.add(ref_table)
+        
+        # Check for circular dependencies using topological sort
+        self._validate_no_cycles()
+    
+    def _validate_no_cycles(self) -> None:
+        """Validate that there are no circular dependencies in the relationship graph"""
+        # Build reverse dependency map for topological sort
+        in_degree = defaultdict(int)
+        adj_list = defaultdict(list)
+        
+        all_tables = set(self.datasets.keys())
+        for table in all_tables:
+            in_degree[table] = 0
+        
+        # Build adjacency list based on foreign key relationships
+        for table, fkeys in self.dependency_graph.items():
+            for fkey in fkeys:
+                # Infer parent table (this is simplified - in practice you'd have explicit parent-child mapping)
+                for potential_parent in all_tables:
+                    if potential_parent != table and fkey in self.datasets[potential_parent].columns:
+                        adj_list[potential_parent].append(table)
+                        in_degree[table] += 1
+                        break
+        
+        # Topological sort
+        queue = deque([table for table in all_tables if in_degree[table] == 0])
+        processed = 0
+        
+        while queue:
+            current = queue.popleft()
+            processed += 1
+            
+            for neighbor in adj_list[current]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        
+        if processed != len(all_tables):
+            raise ValueError("Circular dependency detected in foreign key relationships")
+    
+    def _create_master_index(self) -> None:
+        """
+        Create master index from the table at the "many-est" end of the relationship chain.
+        This table defines the final row count for all aligned datasets.
+        """
+        # Find the table with the most rows (likely the "many" side)
+        row_counts = {name: len(df) for name, df in self.datasets.items()}
+        self.master_table = max(row_counts, key=row_counts.get)
+        
+        # Create master index with global ID
+        master_df = self.datasets[self.master_table]
+        self.master_index = pd.DataFrame()
+        
+        # Add foreign keys from master table
+        if self.master_table in self.dependency_graph:
+            for fkey in self.dependency_graph[self.master_table]:
+                if fkey in master_df.columns:
+                    self.master_index[fkey] = master_df[fkey]
+        
+        # Add primary key if it exists (assume index or first column)
+        if master_df.index.name and master_df.index.name not in self.master_index.columns:
+            self.master_index[master_df.index.name] = master_df.index
+        
+        # Create global ID for grouping
+        self.master_index['_global_id'] = range(len(self.master_index))
+        
+        # Reset index to ensure clean merging
+        self.master_index = self.master_index.reset_index(drop=True)
+    
+    def _join_and_reconstruct(self) -> Dict[str, pd.DataFrame]:
+        """
+        Join all tables to the master index and reconstruct separate aligned DataFrames.
+        """
+        # Start with master index
+        merged_df = self.master_index.copy()
+        table_columns = {self.master_table: list(self.datasets[self.master_table].columns)}
+        
+        # Join each table to the master index
+        for table_name, df in self.datasets.items():
+            if table_name == self.master_table:
+                # Add remaining columns from master table
+                master_df_reset = self.datasets[self.master_table].reset_index(drop=True)
+                master_df_reset['_temp_master_idx'] = range(len(master_df_reset))
+                merged_df['_temp_master_idx'] = merged_df['_global_id']
+                
+                merged_df = merged_df.merge(
+                    master_df_reset, 
+                    on='_temp_master_idx', 
+                    how='left',
+                    suffixes=('', f'_{table_name}')
+                )
+                merged_df = merged_df.drop('_temp_master_idx', axis=1)
+                continue
+            
+            # Find join keys for this table
+            join_keys = []
+            if table_name in self.dependency_graph:
+                for fkey in self.dependency_graph[table_name]:
+                    if fkey in df.columns and fkey in merged_df.columns:
+                        join_keys.append(fkey)
+            
+            # Also check if this table's columns appear as foreign keys in master
+            for col in df.columns:
+                if col in merged_df.columns and col not in join_keys:
+                    join_keys.append(col)
+            
+            if join_keys:
+                # Reset index for clean merging
+                df_reset = df.reset_index(drop=True)
+                merged_df = merged_df.merge(
+                    df_reset,
+                    on=join_keys,
+                    how='left',
+                    suffixes=('', f'_{table_name}')
+                )
+                table_columns[table_name] = list(df.columns)
+        
+        # Reconstruct separate DataFrames
+        aligned_datasets = {}
+        
+        for table_name, orig_columns in table_columns.items():
+            table_df = pd.DataFrame()
+            
+            for col in orig_columns:
+                if col in merged_df.columns:
+                    table_df[col] = merged_df[col]
+                elif f"{col}_{table_name}" in merged_df.columns:
+                    table_df[col] = merged_df[f"{col}_{table_name}"]
+            
+            aligned_datasets[table_name] = table_df
+        
+        # Ensure all datasets have same length
+        target_length = len(merged_df)
+        for name, df in aligned_datasets.items():
+            if len(df) != target_length:
+                # Forward fill to match target length if needed
+                aligned_datasets[name] = df.reindex(range(target_length)).fillna(method='ffill')
+        
+        return aligned_datasets
+    
+    def _handle_key_features(self, datasets: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """
+        Handle inclusion/exclusion of key columns as features based on configuration.
+        """
+        if not hasattr(self.config, 'include_keys_as_features') or self.config.include_keys_as_features:
+            return datasets
+        
+        # Remove key columns from datasets
+        processed_datasets = {}
+        
+        for table_name, df in datasets.items():
+            processed_df = df.copy()
+            
+            # Remove foreign keys
+            if hasattr(self.config, 'foreign_keys') and self.config.foreign_keys:
+                if table_name in self.config.foreign_keys:
+                    for fkey in self.config.foreign_keys[table_name]:
+                        if fkey in processed_df.columns:
+                            processed_df = processed_df.drop(fkey, axis=1)
+            
+            # Remove potential primary keys (common names)
+            key_patterns = ['id', '_id', 'key', '_key']
+            for col in processed_df.columns:
+                if any(pattern in col.lower() for pattern in key_patterns):
+                    processed_df = processed_df.drop(col, axis=1)
+            
+            processed_datasets[table_name] = processed_df
+        
+        return processed_datasets
 
 def load_table(path: str) -> pd.DataFrame:
     """Load a single CSV table with enhanced validation."""

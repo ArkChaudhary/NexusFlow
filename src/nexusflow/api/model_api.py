@@ -110,30 +110,34 @@ class NexusFlowModelArtifact:
             raise ValueError(f"Unsupported data format: {type(data)}")
     
     def _process_named_tables(self, data: Dict[str, pd.DataFrame]) -> List[torch.Tensor]:
-        """Process data provided as named tables dictionary with categorical encoding."""
+        """Process data provided as named tables dictionary with RelationalAligner."""
+        from nexusflow.data.ingestion import RelationalAligner
+        
+        # Apply same sophisticated alignment as training
+        aligner = RelationalAligner(data, self.config)
+        aligned_data = aligner.align()
+        
         feature_tensors = []
         
         for dataset_config in self.datasets_config:
             dataset_name = dataset_config['name']
             
-            if dataset_name not in data:
-                raise KeyError(f"Required dataset '{dataset_name}' not found in input data")
+            if dataset_name not in aligned_data:
+                raise KeyError(f"Required dataset '{dataset_name}' not found in aligned data")
             
-            df = data[dataset_name].copy()
+            df = aligned_data[dataset_name].copy()
 
-            # --- FIX: Convert datetime columns to numeric before processing ---
+            # Convert datetime columns to numeric before processing
             for col in df.select_dtypes(include=['datetime64[ns]']).columns:
                 logger.info(f"Converting datetime column '{col}' to numeric timestamp.")
-                df[col] = df[col].astype(np.int64) // 10**9 # Convert to seconds since epoch
+                df[col] = df[col].astype(np.int64) // 10**9
             
             # Apply preprocessing if available
             if dataset_name in self.preprocessors:
                 logger.info(f"Applying preprocessing to {dataset_name}")
                 preprocessor = self.preprocessors[dataset_name]
                 
-                # Transform the dataframe using the trained preprocessor
                 try:
-                    # Use the preprocessor's transform method (assumes it has one)
                     if hasattr(preprocessor, 'transform'):
                         processed_df = preprocessor.transform(df)
                     elif hasattr(preprocessor, 'apply_transformations'):
@@ -147,7 +151,6 @@ class NexusFlowModelArtifact:
                 
                 df = processed_df
             else:
-                # Manual categorical encoding fallback
                 logger.info(f"No preprocessor found for {dataset_name}, using manual categorical encoding")
                 df = self._manual_categorical_encoding(df, dataset_config)
             
@@ -163,13 +166,11 @@ class NexusFlowModelArtifact:
                 raise ValueError(f"No feature columns found in dataset '{dataset_name}'")
             
             # Convert to tensor
-            features_df = df[feature_cols].fillna(0)  # Handle missing values
+            features_df = df[feature_cols].fillna(0)
             
-            # Ensure all data is numeric
             try:
                 tensor = torch.tensor(features_df.values.astype(np.float32))
             except ValueError as e:
-                # If conversion still fails, show which columns have issues
                 non_numeric_cols = []
                 for col in feature_cols:
                     try:
@@ -178,7 +179,7 @@ class NexusFlowModelArtifact:
                         non_numeric_cols.append(col)
                 
                 raise ValueError(f"Cannot convert columns to numeric in {dataset_name}: {non_numeric_cols}. "
-                               f"Original error: {e}")
+                            f"Original error: {e}")
             
             feature_tensors.append(tensor)
             logger.info(f"Processed {dataset_name}: {tensor.shape}")
