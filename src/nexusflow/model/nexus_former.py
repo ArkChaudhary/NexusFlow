@@ -553,8 +553,8 @@ class NexusFormer(nn.Module):
         logger.info(f"Enhanced NexusFormer initialized: {self.num_encoders} {encoder_type} encoders, "
                    f"{refinement_iterations} iterations, MoE={use_moe}, FlashAttn={use_flash_attn}")
     
-    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
-        """Enhanced forward pass with adaptive fusion."""
+    def forward(self, inputs: List[torch.Tensor], key_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Enhanced forward pass with adaptive fusion and optional key features."""
         if len(inputs) != len(self.encoders):
             raise ValueError(f"Expected {len(self.encoders)} inputs, got {len(inputs)}")
         
@@ -567,10 +567,23 @@ class NexusFormer(nn.Module):
             if x.size(0) != batch_size:
                 raise ValueError(f"Batch size mismatch at input {idx}: {x.size(0)} vs {batch_size}")
         
+        # Process key features if provided
+        key_embeddings = None
+        if key_features is not None:
+            # Simple embedding for key features (primary keys, foreign keys, global_id)
+            if not hasattr(self, 'key_embedding'):
+                self.key_embedding = nn.Linear(key_features.size(-1), self.embed_dim // 4).to(key_features.device)
+            key_embeddings = self.key_embedding(key_features)
+        
         # Initial encoding phase
         representations = []
         for i, (encoder, x) in enumerate(zip(self.encoders, inputs)):
             initial_repr = encoder(x)
+            
+            # Incorporate key features if available
+            if key_embeddings is not None:
+                initial_repr = initial_repr + key_embeddings
+                
             representations.append(initial_repr)
             #logger.debug(f"Initial encoding {i}: shape={initial_repr.shape} mean={initial_repr.mean():.4f}")
         

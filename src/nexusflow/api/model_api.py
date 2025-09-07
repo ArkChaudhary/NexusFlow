@@ -92,14 +92,14 @@ class NexusFlowModelArtifact:
     
     def _preprocess_input(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> List[torch.Tensor]:
         """
-        Preprocess input data into the format expected by the model.
+        Preprocess input data using the same graph-based alignment as training.
         
         Returns:
             List of feature tensors, one per dataset
         """
         if isinstance(data, dict):
-            # Multi-table format with names
-            return self._process_named_tables(data)
+            # Multi-table format with names - use graph-based alignment
+            return self._process_relational_tables(data)
         elif isinstance(data, list):
             # Multi-table format as list
             return self._process_table_list(data)
@@ -108,6 +108,111 @@ class NexusFlowModelArtifact:
             return self._process_flattened_table(data)
         else:
             raise ValueError(f"Unsupported data format: {type(data)}")
+    
+    def _process_relational_tables(self, data: Dict[str, pd.DataFrame]) -> List[torch.Tensor]:
+        """Process relational data using the same graph-based alignment as training."""
+        logger.info("🔄 Processing relational data with graph-based alignment...")
+        
+        # Import the alignment function from ingestion
+        try:
+            from nexusflow.data.ingestion import align_relational_data
+        except ImportError:
+            logger.warning("Graph-based alignment not available, falling back to named tables processing")
+            return self._process_named_tables(data)
+        
+        # Create a minimal config for alignment
+        config_dict = self.config
+        
+        # Build datasets config from metadata if available
+        if 'datasets' not in config_dict and 'relational_schema' in self.meta:
+            config_dict['datasets'] = self.meta['relational_schema']['datasets']
+        
+        try:
+            # Create temporary config object for alignment
+            from nexusflow.config import ConfigModel
+            temp_config = ConfigModel(**config_dict)
+            
+            # Apply the same relational alignment as training
+            aligned_data = align_relational_data(data, temp_config)
+            
+            # Extract the main expanded table
+            target_table = aligned_data['metadata']['target_table']
+            main_df = aligned_data['aligned_tables'][target_table]
+            
+            # Apply preprocessing if available
+            if self.preprocessors and target_table in self.preprocessors:
+                logger.info(f"Applying trained preprocessor to aligned data")
+                preprocessor = self.preprocessors[target_table]
+                
+                # Exclude system columns
+                excluded_cols = {'global_id'}
+                target_col = self.target_info.get('target_column')
+                if target_col and target_col in main_df.columns:
+                    excluded_cols.add(target_col)
+                
+                feature_df = main_df.drop(columns=excluded_cols, errors='ignore')
+                processed_features = preprocessor.transform(feature_df)
+                
+                # Get final feature columns
+                final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+                features_tensor = torch.tensor(processed_features[final_cols].values.astype(np.float32))
+                
+                logger.info(f"Processed aligned data: {features_tensor.shape}")
+                return [features_tensor]
+            else:
+                # Manual processing without trained preprocessor
+                return self._process_aligned_table_manually(main_df)
+                
+        except Exception as e:
+            logger.warning(f"Graph-based alignment failed: {e}, falling back to named tables processing")
+            return self._process_named_tables(data)
+    
+    def _process_aligned_table_manually(self, main_df: pd.DataFrame) -> List[torch.Tensor]:
+        """Manually process aligned table when no trained preprocessor is available."""
+        df = main_df.copy()
+        
+        # Convert datetime columns to numeric
+        for col in df.select_dtypes(include=['datetime64[ns]']).columns:
+            logger.info(f"Converting datetime column '{col}' to numeric timestamp.")
+            df[col] = df[col].astype(np.int64) // 10**9
+        
+        # Exclude system and target columns
+        excluded_cols = {'global_id'}
+        target_col = self.target_info.get('target_column')
+        if target_col and target_col in df.columns:
+            excluded_cols.add(target_col)
+        
+        feature_cols = [col for col in df.columns if col not in excluded_cols]
+        
+        if not feature_cols:
+            raise ValueError("No feature columns found in aligned data")
+        
+        # Manual categorical encoding
+        for col in feature_cols:
+            if df[col].dtype == 'object' or df[col].dtype.name == 'category':
+                logger.info(f"Encoding categorical column: {col}")
+                unique_values = df[col].dropna().unique()
+                value_map = {val: idx for idx, val in enumerate(unique_values)}
+                df[col] = df[col].map(value_map).fillna(-1)
+        
+        # Convert to tensor
+        features_df = df[feature_cols].fillna(0)
+        
+        try:
+            tensor = torch.tensor(features_df.values.astype(np.float32))
+        except ValueError as e:
+            non_numeric_cols = []
+            for col in feature_cols:
+                try:
+                    pd.to_numeric(features_df[col])
+                except (ValueError, TypeError):
+                    non_numeric_cols.append(col)
+            
+            raise ValueError(f"Cannot convert columns to numeric in aligned data: {non_numeric_cols}. "
+                           f"Original error: {e}")
+        
+        logger.info(f"Manually processed aligned data: {tensor.shape}")
+        return [tensor]
     
     def _process_named_tables(self, data: Dict[str, pd.DataFrame]) -> List[torch.Tensor]:
         """Process data provided as named tables dictionary with categorical encoding."""
