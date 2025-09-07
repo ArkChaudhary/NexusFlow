@@ -12,6 +12,7 @@ import time
 from nexusflow.config import ConfigModel
 from nexusflow.model.nexus_former import NexusFormer
 from nexusflow.data.ingestion import load_and_preprocess_datasets, make_dataloaders, flatten_relational_data, load_table, align_datasets
+from nexusflow.data.dataset import AlignedData
 from nexusflow.data.preprocessor import TabularPreprocessor
 from nexusflow.api.model_api import ModelAPI
 
@@ -155,7 +156,7 @@ class Trainer:
         self.mlops_logger.log_architecture_stats(self.model, self.cfg)
 
     def _setup_enhanced_data(self):
-        """Enhanced data setup with RESTORED multi-table support."""
+        """Enhanced data setup with TRUE multi-table support using AlignedData."""
         training_cfg = self.cfg.training
         
         if training_cfg.use_synthetic:
@@ -164,74 +165,116 @@ class Trainer:
             feature_dim = training_cfg.synthetic.feature_dim if training_cfg.synthetic else 5
             
             self.input_dims = [feature_dim] * n_datasets
-            self.datasets = None
-            self.preprocessing_metadata = None
+            self.aligned_data = None
+            self.preprocessors = {}
             logger.info(f"   Synthetic data: {n_datasets} datasets × {feature_dim} features")
             
         else:
-            logger.info("📊 Loading datasets with RESTORED multi-table support...")
+            logger.info("📊 Loading datasets with TRUE relational alignment...")
             
-            # RESTORED: Use multi-table preprocessing pipeline (no flattening)
+            # Load raw datasets
+            raw_datasets = {}
+            for dataset_cfg in self.cfg.datasets:
+                path = f"datasets/{dataset_cfg.name}"
+                df = load_table(path)
+                raw_datasets[dataset_cfg.name] = df
+            
+            # Apply TRUE relational alignment (NEW)
+            from nexusflow.data.ingestion import align_relational_data
+            self.aligned_data = align_relational_data(raw_datasets, self.cfg)
+            
+            # Apply preprocessing to aligned data if enabled
             if training_cfg.use_advanced_preprocessing:
-                self.datasets, self.preprocessors = load_and_preprocess_datasets(self.cfg)
-                logger.info(f"✅ Multi-table preprocessing applied to {len(self.preprocessors)} dataset(s)")
-                
-                # Calculate input dimensions for each separate dataset
-                self.input_dims = []
-                for dataset_cfg in self.cfg.datasets:
-                    dataset_name = dataset_cfg.name
-                    if dataset_name in self.datasets:
-                        df = self.datasets[dataset_name]
-                        
-                        # Calculate features for this specific dataset
-                        excluded_cols = {self.cfg.primary_key}
-                        target_col = self.cfg.target.get('target_column')
-                        if target_col and target_col in df.columns:
-                            excluded_cols.add(target_col)
-                        
-                        feature_cols = [col for col in df.columns if col not in excluded_cols]
-                        self.input_dims.append(len(feature_cols))
-                        
-                        logger.info(f"   Dataset {dataset_name}: {len(feature_cols)} features")
-                
+                self.aligned_data = self._apply_preprocessing_to_aligned_data(self.aligned_data)
+                # preprocessors are set in _apply_preprocessing_to_aligned_data
             else:
-                # Fallback to legacy preprocessing but keep multi-table structure
-                logger.info("Using multi-table data with simple preprocessing")
-                raw_datasets = {}
-                for dataset_cfg in self.cfg.datasets:
-                    path = f"datasets/{dataset_cfg.name}"
-                    df = load_table(path)
-                    raw_datasets[dataset_cfg.name] = df
-                
-                # Use align_datasets instead of flattening
-                self.datasets = align_datasets(raw_datasets, self.cfg.primary_key)
                 self.preprocessors = {}
-                
-                # Calculate dimensions for each aligned dataset
-                self.input_dims = []
-                for dataset_cfg in self.cfg.datasets:
-                    dataset_name = dataset_cfg.name
-                    if dataset_name in self.datasets:
-                        df = self.datasets[dataset_name]
-                        
-                        excluded_cols = {self.cfg.primary_key}
-                        target_col = self.cfg.target.get('target_column')
-                        if target_col and target_col in df.columns:
-                            excluded_cols.add(target_col)
-                        
-                        feature_cols = [col for col in df.columns if col not in excluded_cols]
-                        self.input_dims.append(len(feature_cols))
             
-            # Enhanced data quality reporting
-            total_samples = len(list(self.datasets.values())[0]) if self.datasets else 0
-            total_features = sum(self.input_dims)
+            # Calculate input dimensions from the main expanded table
+            main_table = self.aligned_data['aligned_tables'][self.aligned_data['metadata']['target_table']]
+            target_col = self.cfg.target.get('target_column')
+            excluded_cols = {'global_id', target_col} if target_col else {'global_id'}
             
-            logger.info(f"📈 Multi-table data pipeline complete:")
-            logger.info(f"   Samples per table: {total_samples:,}")
-            logger.info(f"   Feature dimensions: {self.input_dims}")
-            logger.info(f"   Total features: {total_features}")
-            logger.info(f"   Separate datasets: {len(self.cfg.datasets)}")
-            logger.info(f"   Preprocessing: {'advanced' if self.preprocessors else 'simple'}")
+            feature_cols = [col for col in main_table.columns if col not in excluded_cols]
+            self.input_dims = [len(feature_cols)]  # Single expanded table
+            
+            logger.info(f"📈 TRUE relational alignment complete:")
+            logger.info(f"   Target table: {self.aligned_data['metadata']['target_table']}")
+            logger.info(f"   Expanded table size: {len(main_table):,} rows")
+            logger.info(f"   Feature columns: {len(feature_cols)}")
+            
+            join_stats = self.aligned_data['metadata'].get('join_stats', {})
+            logger.info(f"   Row expansions: {join_stats.get('total_expansions', 0)}")
+            logger.info(f"   Join operations: {len(join_stats.get('join_operations', []))}")
+
+    def _apply_preprocessing_to_aligned_data(self, aligned_data: AlignedData) -> AlignedData:
+        """Apply preprocessing to the aligned relational data."""
+        logger.info("🔄 Applying preprocessing to aligned data...")
+        
+        main_table_name = aligned_data['metadata']['target_table']
+        main_df = aligned_data['aligned_tables'][main_table_name].copy()
+        
+        # Create single preprocessor for the expanded table
+        from nexusflow.data.preprocessor import TabularPreprocessor
+        preprocessor = TabularPreprocessor()
+        
+        # Exclude target and system columns
+        target_col = self.cfg.target.get('target_column')
+        excluded_cols = {'global_id'}
+        if target_col:
+            excluded_cols.add(target_col)
+        
+        feature_df = main_df.drop(columns=excluded_cols, errors='ignore')
+        
+        # Auto-detect or use configured column types
+        categorical_cols = []
+        numerical_cols = []
+        
+        # Aggregate column type info from original dataset configs
+        for dataset_cfg in self.cfg.datasets:
+            if dataset_cfg.categorical_columns:
+                categorical_cols.extend([col for col in dataset_cfg.categorical_columns if col in feature_df.columns])
+            if dataset_cfg.numerical_columns:
+                numerical_cols.extend([col for col in dataset_cfg.numerical_columns if col in feature_df.columns])
+        
+        # Auto-detect remaining columns
+        if self.cfg.training.auto_detect_types:
+            remaining_cols = [col for col in feature_df.columns 
+                            if col not in categorical_cols and col not in numerical_cols]
+            
+            for col in remaining_cols:
+                if feature_df[col].dtype in ['object', 'category', 'bool']:
+                    categorical_cols.append(col)
+                elif pd.api.types.is_numeric_dtype(feature_df[col]):
+                    numerical_cols.append(col)
+        
+        # Fit and transform
+        if categorical_cols or numerical_cols:
+            preprocessor.fit(feature_df, categorical_cols, numerical_cols)
+            processed_features = preprocessor.transform(feature_df)
+            
+            # Reconstruct the main table with processed features
+            final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+            processed_df = processed_features[final_cols].copy()
+            
+            # Add back excluded columns
+            for col in excluded_cols:
+                if col in main_df.columns:
+                    processed_df[col] = main_df[col].values
+            
+            # Update aligned data
+            aligned_data['aligned_tables'][main_table_name] = processed_df
+            aligned_data['metadata']['preprocessing_applied'] = True
+            
+            # Store preprocessor for later use
+            self.preprocessors = {main_table_name: preprocessor}
+            
+            logger.info(f"✅ Preprocessing applied to expanded table: {len(final_cols)} features")
+        else:
+            logger.info("⚠️ No features found for preprocessing")
+            self.preprocessors = {}
+        
+        return aligned_data
 
     def _initialize_preprocessing_aware_model(self):
         """Initialize model with preprocessing awareness."""
@@ -315,22 +358,23 @@ class Trainer:
                 pass  # Handler already removed
 
     def _setup_enhanced_dataloaders(self):
-        """Enhanced DataLoader setup with preprocessing integration."""
+        """Enhanced DataLoader setup with AlignedData support."""
         if self.cfg.training.use_synthetic:
-            # Use existing synthetic data generation logic
             self._setup_synthetic_dataloaders()
         else:
-            # Use enhanced preprocessing-aware dataloaders
-            logger.info("🔄 Creating enhanced dataloaders with preprocessing...")
+            logger.info("🔄 Creating dataloaders from AlignedData...")
+            
+            # Use the NEW make_dataloaders function with AlignedData
+            from nexusflow.data.ingestion import make_dataloaders
             
             self.train_loader, self.val_loader, self.test_loader, self.preprocessing_metadata = make_dataloaders(
-                self.cfg, self.datasets, self.preprocessors
+                self.cfg, self.aligned_data, self.preprocessors  # Pass aligned_data instead of datasets
             )
             
-            logger.info(f"Enhanced DataLoaders created with preprocessing metadata")
+            logger.info(f"Enhanced DataLoaders created from AlignedData")
             if self.preprocessing_metadata:
-                logger.info(f"  Preprocessing info: {len(self.preprocessing_metadata['dataset_order'])} datasets")
-                logger.info(f"  Feature dimensions: {self.preprocessing_metadata['feature_dimensions']}")
+                logger.info(f"  AlignedData metadata: {self.preprocessing_metadata['aligned_data_metadata']['target_table']}")
+                logger.info(f"  Total expansions: {self.preprocessing_metadata['aligned_data_metadata']['join_stats'].get('total_expansions', 0)}")
 
     def _setup_synthetic_dataloaders(self):
         """Setup synthetic dataloaders (existing logic)."""
@@ -540,9 +584,16 @@ class Trainer:
         logger.info("✅ All Phase 2 enhanced sanity checks passed!")
 
     def train(self):
-        """Enhanced training loop with Phase 2 preprocessing integration."""
+        """Enhanced training loop with three-tensor batch handling."""
         epochs = int(self.cfg.training.epochs)
-        logger.info(f"🎯 Starting Phase 2 enhanced training: {epochs} epochs")
+        logger.info(f"🎯 Starting TRUE multi-table training: {epochs} epochs")
+
+        logger.info(f"DEBUG: aligned_data type: {type(self.aligned_data)}")
+        if self.aligned_data:
+            logger.info(f"DEBUG: aligned_data keys: {self.aligned_data.keys()}")
+            logger.info(f"DEBUG: target_table: {self.aligned_data['metadata']['target_table']}")
+        else:
+            logger.error("DEBUG: aligned_data is None!")
 
         self._setup_enhanced_dataloaders()
         
@@ -561,14 +612,24 @@ class Trainer:
             for batch_idx, batch in enumerate(self.train_loader):
                 if self.cfg.training.use_synthetic:
                     *features, targets = batch
+                    key_features = None  # Synthetic data doesn't have key features yet
                 else:
-                    features, targets = batch
+                    # NEW: Unpack three-tensor structure
+                    features, key_features, targets = batch
                 
                 features = [f.to(self.device) for f in features]
+                if key_features is not None:
+                    key_features = key_features.to(self.device)
                 targets = targets.to(self.device)
 
                 self.optim.zero_grad()
-                predictions = self.model(features)
+                
+                # Pass key_features to model if available
+                if key_features is not None:
+                    predictions = self.model(features, key_features=key_features)
+                else:
+                    predictions = self.model(features)
+                    
                 loss = self._calculate_loss(predictions, targets)
                 loss.backward()
                 
@@ -586,8 +647,8 @@ class Trainer:
             
             avg_train_loss = train_loss / train_batches
             
-            # Validation phase
-            val_metrics = self._validate_epoch()
+            # Validation phase (updated for three-tensor structure)
+            val_metrics = self._validate_epoch_enhanced()
             
             # Learning rate scheduling
             if val_metrics and 'val_loss' in val_metrics:
@@ -617,8 +678,8 @@ class Trainer:
             # Progress logging
             progress_pct = (epoch / epochs) * 100
             logger.info(f"🔄 Epoch {epoch}/{epochs} ({progress_pct:.1f}%): "
-                       f"train_loss={avg_train_loss:.6f} val_loss={val_metrics.get('val_loss', 'N/A')} "
-                       f"time={epoch_time:.2f}s lr={self.optim.param_groups[0]['lr']:.2e}")
+                    f"train_loss={avg_train_loss:.6f} val_loss={val_metrics.get('val_loss', 'N/A')} "
+                    f"time={epoch_time:.2f}s lr={self.optim.param_groups[0]['lr']:.2e}")
             
             # Store training history
             self.training_history.append(epoch_metrics)
@@ -629,12 +690,56 @@ class Trainer:
             # Early stopping
             if (self.cfg.training.early_stopping and 
                 self.epochs_without_improvement >= self.cfg.training.patience):
-                logger.info(f"🛑 Early stopping triggered after {epoch} epochs "
-                           f"(no improvement for {self.epochs_without_improvement} epochs)")
+                logger.info(f"🛑 Early stopping triggered after {epoch} epochs")
                 break
         
         # Post-training finalization
         self._finalize_enhanced_training()
+
+    def _validate_epoch_enhanced(self) -> Dict[str, float]:
+        """Enhanced validation with three-tensor batch handling."""
+        if self.val_loader is None:
+            return {}
+        
+        self.model.eval()
+        total_loss = 0.0
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch in self.val_loader:
+                if self.cfg.training.use_synthetic:
+                    *features, targets = batch
+                    key_features = None
+                else:
+                    features, key_features, targets = batch
+                
+                features = [f.to(self.device) for f in features]
+                if key_features is not None:
+                    key_features = key_features.to(self.device)
+                targets = targets.to(self.device)
+                
+                # Pass key_features if available
+                if key_features is not None:
+                    predictions = self.model(features, key_features=key_features)
+                else:
+                    predictions = self.model(features)
+                    
+                loss = self._calculate_loss(predictions, targets)
+                
+                total_loss += loss.item()
+                all_predictions.append(predictions.cpu())
+                all_targets.append(targets.cpu())
+        
+        # Calculate comprehensive metrics
+        all_predictions = torch.cat(all_predictions)
+        all_targets = torch.cat(all_targets)
+        
+        avg_loss = total_loss / len(self.val_loader)
+        metrics = self._calculate_metrics(all_predictions, all_targets)
+        metrics['val_loss'] = avg_loss
+        
+        return metrics
 
     def _finalize_enhanced_training(self):
         """Enhanced training finalization with preprocessing artifacts."""

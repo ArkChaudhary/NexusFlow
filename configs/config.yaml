@@ -1,34 +1,51 @@
 project_name: "nexusflow_churn_prediction"
-primary_key: "user_id"
 
 target:
   target_column: "churn_risk"
   target_table: "users.csv"
 
-# Dataset configurations with different transformer types
+# Enhanced dataset configurations with true relational support
 datasets:
   - name: "users.csv"
-    transformer_type: "ft_transformer"  # Feature Tokenizer Transformer for tabular data
+    transformer_type: "ft_transformer"
     complexity: "medium"
     context_weight: 1.0
+    primary_key: ["user_id"]  # Composite key support
     categorical_columns: ["region", "subscription_tier"]
     numerical_columns: ["age", "income", "account_tenure_months", "num_products", "support_tickets"]
   
   - name: "transactions.csv"
-    transformer_type: "standard"  # Standard transformer with FlashAttention
+    transformer_type: "standard"
     complexity: "medium"
     context_weight: 0.8
+    primary_key: ["transaction_id"]
+    foreign_keys:
+      - columns: ["user_id"]  # FK to users table
+        references_table: "users.csv"
+        references_columns: ["user_id"]
     categorical_columns: ["payment_method", "transaction_category"]
     numerical_columns: ["transaction_amount", "transaction_frequency", "days_since_last_transaction", "merchant_rating"]
+  
+  - name: "user_interactions.csv"
+    transformer_type: "standard"
+    complexity: "small"
+    context_weight: 0.6
+    primary_key: ["interaction_id"]
+    foreign_keys:
+      - columns: ["user_id"]
+        references_table: "users.csv"
+        references_columns: ["user_id"]
+    categorical_columns: ["interaction_type", "channel"]
+    numerical_columns: ["interaction_duration", "satisfaction_score"]
 
 # Advanced architecture configuration
 architecture:
   global_embed_dim: 128
   refinement_iterations: 4
-  use_moe: true              # Enable Mixture of Experts
-  num_experts: 6             # Number of expert networks
-  use_flash_attn: true       # Enable FlashAttention optimization
-  top_k_contexts: 3          # Limit cross-attention to top-3 most relevant contexts
+  use_moe: true
+  num_experts: 6
+  use_flash_attn: true
+  top_k_contexts: 3
 
 # Training configuration
 training:
@@ -39,11 +56,8 @@ training:
     lr: 0.001
     weight_decay: 0.0001
   
-  # Advanced preprocessing
   use_advanced_preprocessing: true
   auto_detect_types: true
-  
-  # Training optimizations
   early_stopping: true
   patience: 5
   gradient_clipping: 1.0

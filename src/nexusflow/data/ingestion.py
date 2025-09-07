@@ -7,9 +7,255 @@ from typing import Dict, Tuple, List, Optional, Any
 import os
 import torch
 
-from nexusflow.config import ConfigModel, DatasetConfig
-from nexusflow.data.dataset import NexusFlowDataset
+from nexusflow.config import ConfigModel, DatasetConfig, ForeignKeyConfig
+from nexusflow.data.dataset import NexusFlowDataset, AlignedData
 from nexusflow.data.preprocessor import TabularPreprocessor, FeatureTokenizer, create_column_info_from_preprocessor
+from dataclasses import dataclass
+import uuid
+
+
+def align_relational_data(datasets: Dict[str, pd.DataFrame], cfg: ConfigModel) -> AlignedData:
+    """
+    True relational alignment with global_id and row expansion.
+    
+    This function performs proper relational joins without data loss,
+    expanding the target table as needed for one-to-many relationships.
+    """
+    logger.info("🔗 Starting true relational alignment with global_id...")
+    
+    if cfg.training.use_synthetic or not cfg.datasets:
+        # Fallback for synthetic data
+        return _create_fallback_aligned_data(datasets)
+    
+    # Step 1: Identify target table and build dependency graph
+    target_table_name = cfg.target.get('target_table')
+    if not target_table_name or target_table_name not in datasets:
+        logger.warning("No valid target table, using first dataset")
+        target_table_name = list(datasets.keys())[0]
+    
+    base_df = datasets[target_table_name].copy()
+    logger.info(f"Base table: {target_table_name} ({len(base_df)} rows)")
+    
+    # Step 2: Assign global_id to base table
+    base_df['global_id'] = [str(uuid.uuid4()) for _ in range(len(base_df))]
+    
+    # Initialize key mapping
+    target_dataset_config = next(d for d in cfg.datasets if d.name == target_table_name)
+    target_pk = target_dataset_config.primary_key
+    target_pk_cols = target_pk if isinstance(target_pk, list) else [target_pk]
+    
+    key_map_data = []
+    for _, row in base_df.iterrows():
+        key_map_entry = {'global_id': row['global_id'], 'source_table': target_table_name}
+        for pk_col in target_pk_cols:
+            key_map_entry[f'{target_table_name}_{pk_col}'] = row[pk_col]
+        key_map_data.append(key_map_entry)
+    
+    # Step 3: Build join graph and determine join order
+    join_graph = _build_join_dependency_graph(cfg.datasets)
+    join_order = _determine_join_order(join_graph, target_table_name)
+    
+    # Step 4: Perform sequential joins with row expansion
+    aligned_tables = {target_table_name: base_df}
+    join_stats = {'total_expansions': 0, 'join_operations': []}
+    
+    for table_name in join_order:
+        if table_name == target_table_name:
+            continue
+            
+        table_df = datasets[table_name].copy()
+        dataset_config = next(d for d in cfg.datasets if d.name == table_name)
+        
+        # Find the foreign key that connects to already joined tables
+        connecting_fk = None
+        for fk in dataset_config.foreign_keys or []:
+            if fk.references_table in aligned_tables:
+                connecting_fk = fk
+                break
+        
+        if not connecting_fk:
+            logger.warning(f"No connection found for {table_name}, skipping")
+            continue
+        
+        # Perform the join with row expansion
+        expanded_result, expansion_stats = _perform_expansion_join(
+            aligned_tables[connecting_fk.references_table],
+            table_df,
+            connecting_fk,
+            table_name
+        )
+        
+        # Update key mapping for new rows
+        _update_key_mapping(key_map_data, expanded_result, table_name, dataset_config)
+        
+        aligned_tables[connecting_fk.references_table] = expanded_result
+        join_stats['total_expansions'] += expansion_stats['expansions']
+        join_stats['join_operations'].append({
+            'table': table_name,
+            'type': expansion_stats['join_type'],
+            'expansions': expansion_stats['expansions']
+        })
+        
+        logger.info(f"✅ Joined {table_name}: {expansion_stats['expansions']} row expansions")
+    
+    # Step 5: Create final key mapping DataFrame
+    key_map_df = pd.DataFrame(key_map_data)
+    
+    logger.info(f"🎯 Relational alignment complete:")
+    logger.info(f"   Total row expansions: {join_stats['total_expansions']}")
+    logger.info(f"   Final base table size: {len(aligned_tables[target_table_name])}")
+    logger.info(f"   Joined tables: {len(join_stats['join_operations'])}")
+    
+    return AlignedData(
+        aligned_tables=aligned_tables,
+        key_map=key_map_df,
+        metadata={
+            'target_table': target_table_name,
+            'join_stats': join_stats,
+            'original_sizes': {name: len(df) for name, df in datasets.items()}
+        }
+    )
+
+def _perform_expansion_join(base_df: pd.DataFrame, join_df: pd.DataFrame, 
+                           fk_config: 'ForeignKeyConfig', join_table_name: str) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Perform a join that expands the base table for one-to-many relationships.
+    
+    Returns:
+        Tuple of (expanded_dataframe, join_statistics)
+    """
+    # Extract join columns
+    fk_cols = fk_config.columns if isinstance(fk_config.columns, list) else [fk_config.columns]
+    ref_cols = fk_config.references_columns if isinstance(fk_config.references_columns, list) else [fk_config.references_columns]
+    
+    # Detect relationship cardinality
+    base_key_counts = base_df[ref_cols].value_counts()
+    join_key_counts = join_df[fk_cols].value_counts()
+    
+    is_one_to_many = any(join_key_counts > 1)
+    
+    if is_one_to_many:
+        # One-to-many: Expand base table by duplicating rows
+        logger.debug(f"One-to-many join detected for {join_table_name}")
+        
+        # Perform left join which will naturally duplicate base rows
+        expanded_df = base_df.merge(
+            join_df,
+            left_on=ref_cols,
+            right_on=fk_cols,
+            how='left',
+            suffixes=('', f'_from_{join_table_name}')
+        )
+        
+        # Count expansions
+        original_rows = len(base_df)
+        final_rows = len(expanded_df)
+        expansions = final_rows - original_rows
+        
+        join_stats = {
+            'join_type': 'one_to_many',
+            'expansions': expansions,
+            'original_base_rows': original_rows,
+            'final_rows': final_rows
+        }
+    else:
+        # One-to-one: No expansion needed
+        logger.debug(f"One-to-one join detected for {join_table_name}")
+        
+        expanded_df = base_df.merge(
+            join_df,
+            left_on=ref_cols,
+            right_on=fk_cols,
+            how='left',
+            suffixes=('', f'_from_{join_table_name}')
+        )
+        
+        join_stats = {
+            'join_type': 'one_to_one',
+            'expansions': 0,
+            'original_base_rows': len(base_df),
+            'final_rows': len(expanded_df)
+        }
+    
+    return expanded_df, join_stats
+
+def _update_key_mapping(key_map_data: List[Dict], expanded_df: pd.DataFrame, 
+                       table_name: str, dataset_config: 'DatasetConfig'):
+    """Update key mapping with new table's primary keys."""
+    pk = dataset_config.primary_key
+    pk_cols = pk if isinstance(pk, list) else [pk]
+    
+    # Create a mapping from global_id to the new table's keys
+    global_id_to_keys = {}
+    
+    for _, row in expanded_df.iterrows():
+        global_id = row['global_id']
+        if global_id not in global_id_to_keys:
+            global_id_to_keys[global_id] = []
+        
+        # Store this row's keys from the joined table
+        row_keys = {}
+        for pk_col in pk_cols:
+            col_name = f'{table_name}_{pk_col}'
+            if col_name in row or pk_col in row:
+                row_keys[f'{table_name}_{pk_col}'] = row.get(col_name, row.get(pk_col))
+        
+        if row_keys:  # Only add if we found valid keys
+            global_id_to_keys[global_id].append(row_keys)
+    
+    # Update the key_map_data with the new keys
+    for entry in key_map_data:
+        global_id = entry['global_id']
+        if global_id in global_id_to_keys:
+            # For now, take the first set of keys (could be enhanced later)
+            keys = global_id_to_keys[global_id][0] if global_id_to_keys[global_id] else {}
+            entry.update(keys)
+
+def _build_join_dependency_graph(datasets_config: List['DatasetConfig']) -> Dict[str, List[str]]:
+    """Build dependency graph for determining join order."""
+    graph = {}
+    
+    for dataset in datasets_config:
+        graph[dataset.name] = []
+        if dataset.foreign_keys:
+            for fk in dataset.foreign_keys:
+                graph[dataset.name].append(fk.references_table)
+    
+    return graph
+
+def _determine_join_order(graph: Dict[str, List[str]], target_table: str) -> List[str]:
+    """Determine optimal join order using topological sort."""
+    # Simple implementation: tables with no dependencies first
+    no_deps = [table for table, deps in graph.items() if not deps]
+    has_deps = [table for table, deps in graph.items() if deps]
+    
+    # Ensure target table is first
+    join_order = [target_table] if target_table in no_deps else []
+    join_order.extend([t for t in no_deps if t != target_table])
+    join_order.extend(has_deps)
+    
+    return join_order
+
+def _create_fallback_aligned_data(datasets: Dict[str, pd.DataFrame]) -> AlignedData:
+    """Fallback for synthetic data or simple cases."""
+    if not datasets:
+        return AlignedData(aligned_tables={}, key_map=pd.DataFrame(), metadata={})
+    
+    # Simple case: just add global_id to first dataset
+    first_table_name = list(datasets.keys())[0]
+    first_df = datasets[first_table_name].copy()
+    first_df['global_id'] = [str(uuid.uuid4()) for _ in range(len(first_df))]
+    
+    key_map = pd.DataFrame({
+        'global_id': first_df['global_id'],
+        'source_table': [first_table_name] * len(first_df)
+    })
+    
+    return AlignedData(
+        aligned_tables={first_table_name: first_df},
+        key_map=key_map,
+        metadata={'target_table': first_table_name, 'fallback_mode': True}
+    )
 
 def load_table(path: str) -> pd.DataFrame:
     """Load a single CSV table with enhanced validation."""
@@ -53,22 +299,21 @@ def validate_primary_key(df: pd.DataFrame, key: str) -> bool:
     logger.debug(f"Primary key '{key}' validation passed: {len(df[key].unique())} unique values")
     return True
 
-def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFrame], Dict[str, TabularPreprocessor]]:
+def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[AlignedData, Dict[str, TabularPreprocessor]]:
     """
-    Load datasets with multi-table support and individual preprocessing.
-    RESTORED: No flattening - maintains separate tables for multi-agent architecture.
-    """
-    logger.info("🔄 Loading datasets with multi-table support...")
+    UPDATED: Load datasets with true relational alignment and preprocessing.
     
+    Returns AlignedData instead of separate datasets dictionary.
+    """
+    logger.info("🔄 Loading datasets with TRUE relational alignment...")
+    
+    # Load raw datasets
     raw_datasets = {}
-    preprocessors = {}
-    
-    # Load all datasets
     for dataset_cfg in cfg.datasets:
         path = f"datasets/{dataset_cfg.name}"
         df = load_table(path)
         
-        # Validate primary key for this specific dataset
+        # Validate primary key for this dataset
         pk = dataset_cfg.primary_key
         pk_cols = pk if isinstance(pk, list) else [pk]
         
@@ -79,83 +324,87 @@ def load_and_preprocess_datasets(cfg: ConfigModel) -> Tuple[Dict[str, pd.DataFra
         
         raw_datasets[dataset_cfg.name] = df
     
-    # Use align_datasets instead of flatten_relational_data
-    aligned_datasets = align_datasets(raw_datasets, cfg.primary_key)
+    # Perform TRUE relational alignment
+    aligned_data = align_relational_data(raw_datasets, cfg)
+    
+    preprocessors = {}
     
     if not cfg.training.use_advanced_preprocessing:
-        logger.info("Using simple preprocessing (fillna)")
-        return aligned_datasets, {}
+        logger.info("Using simple preprocessing")
+        return aligned_data, preprocessors
     
-    # Apply preprocessing to each aligned DataFrame individually
-    logger.info("Applying individual preprocessing to each aligned dataset...")
-    processed_datasets = {}
+    # Apply preprocessing to the aligned data
+    logger.info("Applying preprocessing to aligned relational data...")
+    
+    main_table_name = aligned_data['metadata']['target_table']
+    main_df = aligned_data['aligned_tables'][main_table_name]
+    
+    # Create preprocessor for the expanded table
+    preprocessor = TabularPreprocessor()
+    
+    # Exclude system and target columns from preprocessing
+    target_col = cfg.target.get('target_column')
+    excluded_cols = {'global_id'}
+    if target_col and target_col in main_df.columns:
+        excluded_cols.add(target_col)
+    
+    feature_df = main_df.copy()
+    for col in excluded_cols:
+        if col in feature_df.columns:
+            feature_df = feature_df.drop(columns=[col])
+    
+    # Aggregate column type information from original dataset configs
+    categorical_cols = []
+    numerical_cols = []
     
     for dataset_cfg in cfg.datasets:
-        dataset_name = dataset_cfg.name
-        if dataset_name not in aligned_datasets:
-            continue
-            
-        df = aligned_datasets[dataset_name]
+        if dataset_cfg.categorical_columns:
+            existing_cat = [col for col in dataset_cfg.categorical_columns if col in feature_df.columns]
+            categorical_cols.extend(existing_cat)
         
-        # Create individual preprocessor for this dataset
-        preprocessor = TabularPreprocessor()
-        
-        # Exclude target column and primary key from preprocessing
-        target_col = cfg.target.get('target_column')
-        feature_df = df.copy()
-        excluded_cols = {cfg.primary_key}
-        if target_col and target_col in feature_df.columns:
-            excluded_cols.add(target_col)
-        
-        # Remove excluded columns for preprocessing
-        for col in excluded_cols:
-            if col in feature_df.columns:
-                feature_df = feature_df.drop(columns=[col])
-        
-        # Get categorical/numerical columns for this specific dataset
-        categorical_cols = dataset_cfg.categorical_columns or []
-        numerical_cols = dataset_cfg.numerical_columns or []
-        
-        # Filter to only columns that exist in this dataset's feature_df
-        existing_categorical = [col for col in categorical_cols if col in feature_df.columns]
-        existing_numerical = [col for col in numerical_cols if col in feature_df.columns]
-        
-        # Auto-detect remaining columns if enabled
-        if cfg.training.auto_detect_types:
-            remaining_cols = [col for col in feature_df.columns 
-                             if col not in existing_categorical and col not in existing_numerical]
-            
-            for col in remaining_cols:
-                if feature_df[col].dtype in ['object', 'category', 'bool']:
-                    existing_categorical.append(col)
-                elif pd.api.types.is_numeric_dtype(feature_df[col]):
-                    existing_numerical.append(col)
-        
-        # Fit and transform this dataset individually
-        if existing_categorical or existing_numerical:
-            preprocessor.fit(feature_df, existing_categorical, existing_numerical)
-            processed_features = preprocessor.transform(feature_df)
-            
-            # Reconstruct dataset with processed features + excluded columns
-            final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
-            processed_df = processed_features[final_cols].copy()
-            
-            # Add back excluded columns
-            for col in excluded_cols:
-                if col in df.columns:
-                    processed_df[col] = df[col]
-            
-            processed_datasets[dataset_name] = processed_df
-            preprocessors[dataset_name] = preprocessor
-            
-            logger.info(f"✅ Processed {dataset_name}: {len(final_cols)} features")
-        else:
-            # No features to process, keep original
-            processed_datasets[dataset_name] = df
-            logger.info(f"⚠️ No features to process in {dataset_name}")
+        if dataset_cfg.numerical_columns:
+            existing_num = [col for col in dataset_cfg.numerical_columns if col in feature_df.columns]
+            numerical_cols.extend(existing_num)
     
-    logger.info("🎯 Multi-table preprocessing complete - datasets remain separate")
-    return processed_datasets, preprocessors
+    # Auto-detect remaining columns if enabled
+    if cfg.training.auto_detect_types:
+        remaining_cols = [col for col in feature_df.columns 
+                         if col not in categorical_cols and col not in numerical_cols]
+        
+        for col in remaining_cols:
+            if feature_df[col].dtype in ['object', 'category', 'bool']:
+                categorical_cols.append(col)
+            elif pd.api.types.is_numeric_dtype(feature_df[col]):
+                numerical_cols.append(col)
+    
+    # Fit and transform
+    if categorical_cols or numerical_cols:
+        preprocessor.fit(feature_df, categorical_cols, numerical_cols)
+        processed_features = preprocessor.transform(feature_df)
+        
+        # Reconstruct the main table with processed features
+        final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+        processed_df = processed_features[final_cols].copy()
+        
+        # Add back excluded columns
+        for col in excluded_cols:
+            if col in main_df.columns:
+                processed_df[col] = main_df[col]
+        
+        # Update the aligned data
+        aligned_data['aligned_tables'][main_table_name] = processed_df
+        preprocessors[main_table_name] = preprocessor
+        
+        # Update metadata
+        aligned_data['metadata']['preprocessing_applied'] = True
+        aligned_data['metadata']['processed_features'] = len(final_cols)
+        
+        logger.info(f"✅ Processed expanded table: {len(final_cols)} features")
+    else:
+        logger.info("⚠️ No features to process in expanded table")
+    
+    logger.info("🎯 TRUE relational preprocessing complete")
+    return aligned_data, preprocessors
 
 def align_datasets(datasets: Dict[str, pd.DataFrame], primary_key: str) -> Dict[str, pd.DataFrame]:
     """Enhanced dataset alignment with better logging."""
@@ -299,73 +548,67 @@ def create_multi_table_dataset(datasets: Dict[str, pd.DataFrame],
     
     return dataset, preprocessing_metadata
 
-def make_dataloaders(cfg: ConfigModel, datasets: Dict[str, pd.DataFrame], 
+def make_dataloaders(cfg: ConfigModel, aligned_data: AlignedData, 
                      preprocessors: Dict[str, TabularPreprocessor] = None):
     """
-    Create dataloaders with multi-table support.
-    RESTORED: Uses create_multi_table_dataset to maintain separate table structure.
+    Create dataloaders from AlignedData structure.
+    
+    Args:
+        cfg: Configuration model
+        aligned_data: AlignedData structure with relational tables
+        preprocessors: Optional preprocessors dictionary
     """
-    logger.info("Creating dataloaders for multi-table data...")
+    logger.info("Creating dataloaders from AlignedData...")
     
-    # Use the restored multi-table dataset creation
-    dataset, preprocessing_metadata = create_multi_table_dataset(
-        datasets, preprocessors or {}, cfg
-    )
+    # Import here to avoid circular imports
+    from nexusflow.data.dataset import NexusFlowDataset, MultiTableDataLoader
     
-    # Split indices from the combined dataset
-    combined_df = dataset.df
-    train_indices, val_indices, test_indices = split_df(
-        combined_df,
-        test_size=cfg.training.split_config.test_size,
-        val_size=cfg.training.split_config.validation_size,
-        randomize=cfg.training.split_config.randomize,
-    )
+    # Create dataset from AlignedData
+    dataset = NexusFlowDataset(aligned_data, target_col=cfg.target['target_column'])
     
-    # Create split datasets
-    train_df = combined_df.iloc[train_indices.index].reset_index(drop=True)
-    val_df = combined_df.iloc[val_indices.index].reset_index(drop=True) if len(val_indices) > 0 else pd.DataFrame()
-    test_df = combined_df.iloc[test_indices.index].reset_index(drop=True)
+    # Split the dataset
+    total_samples = len(dataset)
+    test_size = int(total_samples * cfg.training.split_config.test_size)
+    val_size = int(total_samples * cfg.training.split_config.validation_size)
+    train_size = total_samples - test_size - val_size
     
-    target_column = cfg.target['target_column']
+    # Create indices
+    if cfg.training.split_config.randomize:
+        import torch
+        indices = torch.randperm(total_samples).tolist()
+    else:
+        indices = list(range(total_samples))
     
-    # Create NexusFlowDataset instances with preserved feature_dimensions
-    train_dataset = NexusFlowDataset(train_df, target_col=target_column)
-    train_dataset.feature_dimensions = dataset.feature_dimensions  # CRITICAL: Copy the mapping
-    train_dataset.preprocessing_metadata = preprocessing_metadata
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:train_size + val_size] if val_size > 0 else []
+    test_indices = indices[train_size + val_size:]
     
-    val_dataset = None
-    if len(val_df) > 0:
-        val_dataset = NexusFlowDataset(val_df, target_col=target_column)
-        val_dataset.feature_dimensions = dataset.feature_dimensions
-        val_dataset.preprocessing_metadata = preprocessing_metadata
+    # Create subset datasets
+    from torch.utils.data import Subset
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices) if val_indices else None
+    test_dataset = Subset(dataset, test_indices)
     
-    test_dataset = NexusFlowDataset(test_df, target_col=target_column)
-    test_dataset.feature_dimensions = dataset.feature_dimensions
-    test_dataset.preprocessing_metadata = preprocessing_metadata
-    
-    # Create DataLoaders with custom collate for multi-table data
+    # Create dataloaders
     batch_size = cfg.training.batch_size
     
-    # Use MultiTableDataLoader if we have multi-table data
-    if dataset.feature_dimensions and len(dataset.feature_dimensions) > 1:
-        from nexusflow.data.dataset import MultiTableDataLoader
-        
-        train_loader = MultiTableDataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = MultiTableDataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
-        test_loader = MultiTableDataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-        
-        logger.info("🔀 Using MultiTableDataLoader for multi-agent batching")
-    else:
-        # Standard DataLoader for single table
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = MultiTableDataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = MultiTableDataLoader(val_dataset, batch_size=batch_size, shuffle=False) if val_dataset else None
+    test_loader = MultiTableDataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    logger.info(f"Multi-table DataLoaders created:")
+    # Create preprocessing metadata for backward compatibility
+    preprocessing_metadata = {
+        'aligned_data_metadata': aligned_data['metadata'],
+        'preprocessors': preprocessors or {},
+        'feature_dimensions': dataset.feature_dimensions,
+        'total_samples': total_samples
+    }
+    
+    logger.info(f"AlignedData DataLoaders created:")
     logger.info(f"  Train: {len(train_loader)} batches ({len(train_dataset)} samples)")
-    logger.info(f"  Val: {len(val_loader) if val_loader else 0} batches ({len(val_dataset) if val_dataset else 0} samples)")
+    logger.info(f"  Val: {len(val_loader) if val_loader else 0} batches")
     logger.info(f"  Test: {len(test_loader)} batches ({len(test_dataset)} samples)")
-    logger.info(f"  Feature dimensions per table: {dataset.feature_dimensions}")
+    logger.info(f"  Source: {aligned_data['metadata']['target_table']} (expanded)")
     
     return train_loader, val_loader, test_loader, preprocessing_metadata
 
@@ -452,103 +695,44 @@ def build_join_graph(datasets_config: List[DatasetConfig]) -> Dict[str, Any]:
     logger.info(f"Join graph built: {len(graph['nodes'])} tables, {len(graph['edges'])} relationships")
     return graph
 
+# Mark legacy functions as deprecated
 def flatten_relational_data(datasets: Dict[str, pd.DataFrame], cfg: ConfigModel) -> pd.DataFrame:
     """
-    Intelligent relational data flattening using proper foreign key relationships.
+    DEPRECATED: Use align_relational_data instead.
     
-    This replaces the old single-key alignment with true relational joins.
+    This function performs legacy flattening and should be replaced.
     """
-    if cfg.training.use_synthetic or not cfg.datasets:
-        # Fallback for synthetic data or simple cases
+    import warnings
+    warnings.warn(
+        "flatten_relational_data is deprecated. Use align_relational_data for true relational support.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
+    # Fallback to simple join for backward compatibility
+    if not datasets or len(datasets) == 1:
         return list(datasets.values())[0] if datasets else pd.DataFrame()
     
-    logger.info("🔗 Starting intelligent relational data flattening...")
+    # Simple left join approach
+    base_table_name = cfg.target.get('target_table', list(datasets.keys())[0])
+    result_df = datasets[base_table_name].copy()
     
-    # Build join graph
-    join_graph = build_join_graph(cfg.datasets)
-    
-    # Start with target table as base
-    target_table = cfg.target.get('target_table')
-    if not target_table or target_table not in datasets:
-        logger.warning("No target table specified, using first dataset as base")
-        target_table = list(datasets.keys())[0]
-    
-    base_df = datasets[target_table].copy()
-    logger.info(f"Base table: {target_table} ({len(base_df)} rows)")
-    
-    # Track which tables we've already joined
-    joined_tables = {target_table}
-    result_df = base_df
-    
-    # Iteratively join tables based on dependencies
-    max_iterations = len(datasets) * 2  # Prevent infinite loops
-    iteration = 0
-    
-    while len(joined_tables) < len(datasets) and iteration < max_iterations:
-        iteration += 1
-        progress_made = False
+    for dataset_config in cfg.datasets:
+        if dataset_config.name == base_table_name or not dataset_config.foreign_keys:
+            continue
         
-        for dataset_config in cfg.datasets:
-            table_name = dataset_config.name
-            
-            # Skip if already joined or no foreign keys
-            if table_name in joined_tables or not dataset_config.foreign_keys:
-                continue
-            
-            # Check if all referenced tables are already joined
-            can_join = True
-            for fk in dataset_config.foreign_keys:
-                if fk.references_table not in joined_tables:
-                    can_join = False
-                    break
-            
-            if can_join:
-                # Perform the join
-                table_df = datasets[table_name].copy()
-                
-                # Join with primary foreign key relationship
-                primary_fk = dataset_config.foreign_keys[0]  # Use first FK as primary
-                
-                from_cols = primary_fk.columns if isinstance(primary_fk.columns, list) else [primary_fk.columns]
-                to_cols = primary_fk.references_columns if isinstance(primary_fk.references_columns, list) else [primary_fk.references_columns]
-                
-                # Detect relationship type
-                ref_table_name = primary_fk.references_table
-                ref_key_counts = result_df[to_cols].drop_duplicates()
-                table_key_counts = table_df[from_cols].drop_duplicates()
-                
-                is_one_to_many = len(table_df) > len(table_key_counts)
-                
-                if is_one_to_many:
-                    logger.info(f"Aggregating {table_name} (one-to-many relationship)")
-                    table_df = _aggregate_for_join(table_df, from_cols, dataset_config)
-                
-                # Perform the join
-                result_df = result_df.merge(
-                    table_df, 
-                    left_on=to_cols, 
-                    right_on=from_cols, 
-                    how='left',
-                    suffixes=('', f'_{table_name}')
-                )
-                
-                # Clean up duplicate columns
-                duplicate_cols = [col for col in result_df.columns if col.endswith(f'_{table_name}')]
-                for dup_col in duplicate_cols:
-                    original_col = dup_col.replace(f'_{table_name}', '')
-                    if original_col in result_df.columns:
-                        result_df = result_df.drop(columns=[dup_col])
-                
-                joined_tables.add(table_name)
-                progress_made = True
-                
-                logger.info(f"✅ Joined {table_name}: {len(result_df)} rows, {len(result_df.columns)} columns")
+        table_df = datasets[dataset_config.name]
+        fk = dataset_config.foreign_keys[0]
+        
+        result_df = result_df.merge(
+            table_df,
+            left_on=fk.references_columns,
+            right_on=fk.columns,
+            how='left',
+            suffixes=('', f'_{dataset_config.name}')
+        )
     
-    if len(joined_tables) < len(datasets):
-        missing_tables = set(d.name for d in cfg.datasets) - joined_tables
-        logger.warning(f"Could not join all tables. Missing: {missing_tables}")
-    
-    logger.info(f"🎯 Relational flattening complete: {len(result_df)} rows, {len(result_df.columns)} columns")
+    logger.warning("Used deprecated flattening - consider upgrading to align_relational_data")
     return result_df
 
 def _aggregate_for_join(df: pd.DataFrame, key_columns: List[str], dataset_config: DatasetConfig) -> pd.DataFrame:

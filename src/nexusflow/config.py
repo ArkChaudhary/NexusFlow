@@ -169,6 +169,90 @@ class ConfigModel(BaseModel):
                         raise ValueError(f"Columns cannot be both categorical and numerical: {overlap}")
         return self
 
+    @model_validator(mode='after')
+    def _validate_relational_integrity(self):
+        """Enhanced validation for relational data integrity."""
+        if self.datasets and not self.training.use_synthetic:
+            table_names = {d.name for d in self.datasets}
+            
+            # Validate target table exists
+            target_table = self.target.get('target_table')
+            if target_table and target_table not in table_names:
+                raise ValueError(f"target_table '{target_table}' not found in datasets: {table_names}")
+            
+            # Enhanced foreign key validation
+            for dataset in self.datasets:
+                if dataset.foreign_keys:
+                    for fk in dataset.foreign_keys:
+                        # Check referenced table exists
+                        if fk.references_table not in table_names:
+                            raise ValueError(
+                                f"Foreign key in '{dataset.name}' references unknown table: '{fk.references_table}'"
+                            )
+                        
+                        # Validate column count consistency
+                        fk_cols = fk.columns if isinstance(fk.columns, list) else [fk.columns]
+                        ref_cols = fk.references_columns if isinstance(fk.references_columns, list) else [fk.references_columns]
+                        
+                        if len(fk_cols) != len(ref_cols):
+                            raise ValueError(
+                                f"Foreign key column count mismatch in '{dataset.name}': "
+                                f"{len(fk_cols)} columns reference {len(ref_cols)} columns"
+                            )
+                        
+                        # NEW: Validate that referenced columns match referenced table's primary key
+                        ref_dataset = next(d for d in self.datasets if d.name == fk.references_table)
+                        ref_pk = ref_dataset.primary_key if isinstance(ref_dataset.primary_key, list) else [ref_dataset.primary_key]
+                        
+                        if set(ref_cols) != set(ref_pk):
+                            logger.warning(
+                                f"Foreign key in '{dataset.name}' references non-primary key columns in '{fk.references_table}': "
+                                f"{ref_cols} (primary key: {ref_pk})"
+                            )
+        
+        return self
+
+    @model_validator(mode='after') 
+    def _validate_join_graph_integrity(self):
+        """Validate that join graph forms a connected component."""
+        if self.datasets and len(self.datasets) > 1 and not self.training.use_synthetic:
+            # Build adjacency graph
+            graph = {}
+            for dataset in self.datasets:
+                graph[dataset.name] = set()
+                if dataset.foreign_keys:
+                    for fk in dataset.foreign_keys:
+                        graph[dataset.name].add(fk.references_table)
+                        # Add reverse edge for undirected connectivity check
+                        if fk.references_table not in graph:
+                            graph[fk.references_table] = set()
+                        graph[fk.references_table].add(dataset.name)
+            
+            # Check connectivity using DFS
+            target_table = self.target.get('target_table')
+            start_node = target_table if target_table else list(graph.keys())[0]
+            
+            visited = set()
+            stack = [start_node]
+            
+            while stack:
+                node = stack.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                stack.extend(graph.get(node, []))
+            
+            all_tables = {d.name for d in self.datasets}
+            unreachable = all_tables - visited
+            
+            if unreachable:
+                logger.warning(
+                    f"Tables not connected to main join graph: {unreachable}. "
+                    "These tables will be processed independently."
+                )
+        
+        return self
+
 def load_config_from_file(path: str) -> ConfigModel:
     """Load and validate configuration from YAML file with relational data support."""
     if not os.path.exists(path):
