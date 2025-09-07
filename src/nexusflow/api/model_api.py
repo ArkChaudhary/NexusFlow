@@ -7,15 +7,16 @@ from typing import Dict, Any, List, Union, Optional
 import torch.nn as nn
 import json
 
-class NexusFlowModelArtifact:
+class NexusFlowModel:
     """
-    Complete model artifact that implements the required .predict() and .get_params() interface.
+    Complete NexusFlow model that implements the required .predict() and .get_params() interface.
     This is what gets saved as a .nxf file and provides the end-user API.
+    Combines the functionality of both NexusFlowModelArtifact and ModelAPI.
     """
     
     def __init__(self, model: torch.nn.Module, preprocess_meta: Dict[str, Any]):
         """
-        Initialize the model artifact.
+        Initialize the NexusFlow model.
         
         Args:
             model: Trained NexusFormer model (must be torch.nn.Module)
@@ -24,7 +25,7 @@ class NexusFlowModelArtifact:
         # Add type checking to prevent nested artifacts
         if not isinstance(model, torch.nn.Module):
             raise TypeError(f"Expected torch.nn.Module, got {type(model)}. "
-                        f"If passing a NexusFlowModelArtifact, use artifact.model instead.")
+                        f"If passing a NexusFlowModel, use model.model instead.")
         
         self.model = model
         self.model.eval()  # Always in eval mode for inference
@@ -43,9 +44,35 @@ class NexusFlowModelArtifact:
         # Device management
         self.device = torch.device('cpu')  # Default to CPU for artifacts
         
-        logger.info(f"NexusFlow model artifact initialized with {len(self.input_dims)} input dimensions")
+        logger.info(f"NexusFlow model initialized with {len(self.input_dims)} input dimensions")
         if self.preprocessors:
             logger.info(f"Preprocessors available for: {list(self.preprocessors.keys())}")
+
+    def save(self, path: str):
+        """Save model to .nxf file."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Ensure .nxf extension
+        if not p.suffix == '.nxf':
+            p = p.with_suffix('.nxf')
+        
+        # Check if model has been optimized and update metadata accordingly
+        meta = self.meta.copy()
+        if 'optimization' in meta:
+            optimization_info = meta['optimization']
+            logger.info(f"Saving optimized model with {optimization_info['method']}")
+            logger.info(f"  Size reduction: {optimization_info['size_reduction']:.1%}")
+            logger.info(f"  Parameter reduction: {optimization_info['parameter_reduction']:.1%}")
+        
+        save_data = {
+            'model_state': self.model.state_dict(),
+            'meta': meta,
+            'artifact_version': '1.0'
+        }
+        
+        torch.save(save_data, p)
+        logger.info(f"NexusFlow model saved to: {p}")
     
     def predict(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> np.ndarray:
         """
@@ -340,286 +367,6 @@ class NexusFlowModelArtifact:
             start_idx = end_idx
         
         return feature_tensors
-    
-    def get_params(self) -> Dict[str, Any]:
-        """
-        Get model parameters and configuration.
-        
-        Returns:
-            Dictionary containing all model parameters and training configuration
-        """
-        params = {
-            'model_class': 'NexusFormer',
-            'input_dimensions': self.input_dims,
-            'total_parameters': sum(p.numel() for p in self.model.parameters()),
-            'config': self.config,
-            'training_info': {
-                'best_epoch': self.meta.get('best_epoch'),
-                'best_val_metric': self.meta.get('best_val_metric'),
-                'training_complete': self.meta.get('training_complete', False)
-            },
-            'architecture': {
-                'embed_dim': self.config.get('architecture', {}).get('global_embed_dim', 64),
-                'refinement_iterations': self.config.get('architecture', {}).get('refinement_iterations', 3),
-                'num_encoders': len(self.input_dims)
-            },
-            'datasets_info': {
-                'primary_key': self.primary_key,
-                'target_column': self.target_info.get('target_column'),
-                'target_table': self.target_info.get('target_table'),
-                'num_datasets': len(self.datasets_config),
-                'dataset_names': [d['name'] for d in self.datasets_config] if self.datasets_config else [],
-                'has_preprocessors': bool(self.preprocessors)
-            }
-        }
-        
-        # Add optimization info if model was optimized
-        if 'optimization' in self.meta:
-            params['optimization'] = self.meta['optimization']
-        
-        return params
-    
-    def evaluate(self) -> Dict[str, float]:
-        """
-        Return evaluation metrics from training if available.
-        
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        metrics = {}
-        
-        if 'best_val_metric' in self.meta:
-            metrics['best_validation_metric'] = self.meta['best_val_metric']
-        
-        if 'best_epoch' in self.meta:
-            metrics['best_epoch'] = self.meta['best_epoch']
-        
-        # Add any other stored metrics
-        stored_metrics = self.meta.get('final_metrics', {})
-        metrics.update(stored_metrics)
-        
-        return metrics
-    
-    def get_preprocessing_info(self) -> Dict[str, Any]:
-        """
-        Get information about preprocessing applied to each dataset.
-        
-        Returns:
-            Dictionary with preprocessing information
-        """
-        preprocessing_info = {
-            'has_preprocessors': bool(self.preprocessors),
-            'datasets': {}
-        }
-        
-        for dataset_config in self.datasets_config:
-            dataset_name = dataset_config['name']
-            dataset_info = {
-                'categorical_columns': dataset_config.get('categorical_columns', []),
-                'numerical_columns': dataset_config.get('numerical_columns', []),
-                'transformer_type': dataset_config.get('transformer_type', 'standard'),
-                'has_trained_preprocessor': dataset_name in self.preprocessors
-            }
-            
-            if dataset_name in self.preprocessors:
-                preprocessor = self.preprocessors[dataset_name]
-                if hasattr(preprocessor, 'get_feature_info'):
-                    try:
-                        feature_info = preprocessor.get_feature_info()
-                        dataset_info['preprocessor_info'] = feature_info
-                    except:
-                        pass
-            
-            preprocessing_info['datasets'][dataset_name] = dataset_info
-        
-        return preprocessing_info
-    
-    def visualize_flow(self):
-        """
-        Launch the interactive visualization dashboard.
-        Note: This is a placeholder - full implementation would require web interface.
-        """
-        logger.warning("Interactive visualization not yet implemented")
-        logger.info("Model architecture summary:")
-        logger.info(f"  - {len(self.input_dims)} contextual encoders")
-        logger.info(f"  - Input dimensions: {self.input_dims}")
-        logger.info(f"  - Refinement iterations: {self.config.get('architecture', {}).get('refinement_iterations', 3)}")
-        logger.info(f"  - Total parameters: {sum(p.numel() for p in self.model.parameters())}")
-        logger.info(f"  - Preprocessing: {'Available' if self.preprocessors else 'Manual fallback'}")
-        
-        return {
-            'architecture': 'NexusFormer',
-            'num_encoders': len(self.input_dims),
-            'input_dims': self.input_dims,
-            'refinement_iterations': self.config.get('architecture', {}).get('refinement_iterations', 3),
-            'has_preprocessors': bool(self.preprocessors)
-        }
-    
-    def to(self, device: str):
-        """Move model to specified device."""
-        self.device = torch.device(device)
-        self.model = self.model.to(self.device)
-        logger.info(f"Model moved to device: {device}")
-        return self
-    
-    def summary(self) -> str:
-        """Get a human-readable summary of the model."""
-        params = self.get_params()
-        
-        summary = f"""
-NexusFlow Model Artifact Summary
-================================
-Model Class: {params['model_class']}
-Total Parameters: {params['total_parameters']:,}
-
-Architecture:
-  - Encoders: {params['architecture']['num_encoders']}
-  - Embedding Dimension: {params['architecture']['embed_dim']}
-  - Refinement Iterations: {params['architecture']['refinement_iterations']}
-  - Input Dimensions: {params['input_dimensions']}
-
-Training Info:
-  - Best Epoch: {params['training_info']['best_epoch']}
-  - Best Validation Metric: {params['training_info']['best_val_metric']:.6f}
-  - Training Complete: {params['training_info']['training_complete']}
-
-Data Info:
-  - Primary Key: {params['datasets_info']['primary_key']}
-  - Target Column: {params['datasets_info']['target_column']}
-  - Datasets: {params['datasets_info']['num_datasets']}
-  - Preprocessors: {params['datasets_info']['has_preprocessors']}"""
-
-        # Add optimization info if available
-        if 'optimization' in params:
-            opt_info = params['optimization']
-            summary += f"""
-
-Optimization Info:
-  - Method: {opt_info['method']}
-  - Size Reduction: {opt_info['size_reduction']:.1%}
-  - Parameter Reduction: {opt_info['parameter_reduction']:.1%}
-  - Original Size: {opt_info['original_size_mb']:.2f} MB
-  - Optimized Size: {opt_info['optimized_size_mb']:.2f} MB"""
-
-        return summary.strip()
-
-class ModelAPI:
-    """
-    Enhanced ModelAPI for saving/loading .nxf artifacts.
-    """
-    
-    def __init__(self, model: torch.nn.Module, preprocess_meta: Optional[Dict[str, Any]] = None):
-        """Initialize ModelAPI with model and metadata."""
-        self.artifact = NexusFlowModelArtifact(model, preprocess_meta or {})
-
-    def save(self, path: str):
-        """Save model artifact to .nxf file."""
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Ensure .nxf extension
-        if not p.suffix == '.nxf':
-            p = p.with_suffix('.nxf')
-        
-        # Check if model has been optimized and update metadata accordingly
-        meta = self.artifact.meta.copy()
-        if 'optimization' in meta:
-            optimization_info = meta['optimization']
-            logger.info(f"Saving optimized model with {optimization_info['method']}")
-            logger.info(f"  Size reduction: {optimization_info['size_reduction']:.1%}")
-            logger.info(f"  Parameter reduction: {optimization_info['parameter_reduction']:.1%}")
-        
-        save_data = {
-            'model_state': self.artifact.model.state_dict(),
-            'meta': meta,
-            'artifact_version': '1.0'
-        }
-        
-        torch.save(save_data, p)
-        logger.info(f"NexusFlow model artifact saved to: {p}")
-
-    @staticmethod
-    def load(path: str) -> NexusFlowModelArtifact:
-        """Load model artifact from .nxf file."""
-        p = Path(path)
-        if not p.exists():
-            logger.error(f"Model file not found: {p}")
-            raise FileNotFoundError(p)
-        
-        # Load checkpoint
-        ckpt = torch.load(p, map_location='cpu', weights_only=False)
-        meta = ckpt.get('meta', {})
-        
-        # Check if this is an optimized model
-        is_optimized = 'optimization' in meta
-        optimization_method = meta.get('optimization', {}).get('method', '')
-        
-        if is_optimized:
-            logger.info(f"Loading optimized model with {optimization_method}")
-            
-            if 'quantization' in optimization_method.lower():
-                # For quantized models, we need to create the model and then apply quantization
-                logger.info("Detected quantized model - applying post-load quantization")
-                
-                # First create the original model structure
-                original_model = _create_model_from_meta(meta)
-                
-                # Apply quantization to get the right structure
-                from torch.quantization import quantize_dynamic
-                quantized_model = quantize_dynamic(
-                    original_model, 
-                    {nn.Linear}, 
-                    dtype=torch.qint8
-                )
-                
-                # Now try to load the quantized state dict
-                try:
-                    quantized_model.load_state_dict(ckpt['model_state'], strict=False)
-                    logger.info("Successfully loaded quantized model state")
-                except Exception as e:
-                    logger.warning(f"Failed to load quantized state: {e}")
-                    # Fallback: use the quantized model structure but retrain might be needed
-                    logger.info("Using freshly quantized model structure")
-                
-                return NexusFlowModelArtifact(quantized_model, meta)
-            
-            elif 'pruning' in optimization_method.lower():
-                # For pruned models, create original model and load state normally
-                model = _create_model_from_meta(meta)
-                model.load_state_dict(ckpt['model_state'])
-                return NexusFlowModelArtifact(model, meta)
-        
-        else:
-            # Original unoptimized model
-            model = _create_model_from_meta(meta)
-            model.load_state_dict(ckpt['model_state'])
-            return NexusFlowModelArtifact(model, meta)
-
-    def predict(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> np.ndarray:
-        """
-        Make predictions on new data with Phase 4 relational aggregation support.
-        
-        Args:
-            data: Input data in one of three formats:
-                1. Dict[str, DataFrame] - Multiple tables keyed by dataset name
-                2. List[DataFrame] - Multiple tables in order matching training
-                3. DataFrame - Single flattened table (backwards compatibility)
-        
-        Returns:
-            numpy array of predictions, properly aggregated for expanded rows
-        """
-        logger.info("Making predictions on new data with Phase 4 relational support...")
-        
-        # Check if this model has relational features from Phase 2+ training
-        has_relational_support = self.meta.get('relational_features', {}).get('relational_data_support', False)
-        phase_2_features = self.meta.get('phase_2_features', {})
-        
-        if has_relational_support and isinstance(data, dict) and phase_2_features.get('relational_joins', False):
-            # Use Phase 4 relational prediction pipeline with aggregation
-            return self._predict_relational_with_aggregation(data)
-        else:
-            # Use standard prediction pipeline
-            return self._predict_standard(data)
 
     def _predict_relational_with_aggregation(self, data: Dict[str, pd.DataFrame]) -> np.ndarray:
         """
@@ -897,13 +644,176 @@ class ModelAPI:
                 logger.warning(f"Preprocessing failed during prediction: {e}")
         
         return aligned_data
+    
+    def get_params(self) -> Dict[str, Any]:
+        """
+        Get model parameters and configuration.
+        
+        Returns:
+            Dictionary containing all model parameters and training configuration
+        """
+        params = {
+            'model_class': 'NexusFormer',
+            'input_dimensions': self.input_dims,
+            'total_parameters': sum(p.numel() for p in self.model.parameters()),
+            'config': self.config,
+            'training_info': {
+                'best_epoch': self.meta.get('best_epoch'),
+                'best_val_metric': self.meta.get('best_val_metric'),
+                'training_complete': self.meta.get('training_complete', False)
+            },
+            'architecture': {
+                'embed_dim': self.config.get('architecture', {}).get('global_embed_dim', 64),
+                'refinement_iterations': self.config.get('architecture', {}).get('refinement_iterations', 3),
+                'num_encoders': len(self.input_dims)
+            },
+            'datasets_info': {
+                'primary_key': self.primary_key,
+                'target_column': self.target_info.get('target_column'),
+                'target_table': self.target_info.get('target_table'),
+                'num_datasets': len(self.datasets_config),
+                'dataset_names': [d['name'] for d in self.datasets_config] if self.datasets_config else [],
+                'has_preprocessors': bool(self.preprocessors)
+            }
+        }
+        
+        # Add optimization info if model was optimized
+        if 'optimization' in self.meta:
+            params['optimization'] = self.meta['optimization']
+        
+        return params
+    
+    def evaluate(self) -> Dict[str, float]:
+        """
+        Return evaluation metrics from training if available.
+        
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        metrics = {}
+        
+        if 'best_val_metric' in self.meta:
+            metrics['best_validation_metric'] = self.meta['best_val_metric']
+        
+        if 'best_epoch' in self.meta:
+            metrics['best_epoch'] = self.meta['best_epoch']
+        
+        # Add any other stored metrics
+        stored_metrics = self.meta.get('final_metrics', {})
+        metrics.update(stored_metrics)
+        
+        return metrics
+    
+    def get_preprocessing_info(self) -> Dict[str, Any]:
+        """
+        Get information about preprocessing applied to each dataset.
+        
+        Returns:
+            Dictionary with preprocessing information
+        """
+        preprocessing_info = {
+            'has_preprocessors': bool(self.preprocessors),
+            'datasets': {}
+        }
+        
+        for dataset_config in self.datasets_config:
+            dataset_name = dataset_config['name']
+            dataset_info = {
+                'categorical_columns': dataset_config.get('categorical_columns', []),
+                'numerical_columns': dataset_config.get('numerical_columns', []),
+                'transformer_type': dataset_config.get('transformer_type', 'standard'),
+                'has_trained_preprocessor': dataset_name in self.preprocessors
+            }
+            
+            if dataset_name in self.preprocessors:
+                preprocessor = self.preprocessors[dataset_name]
+                if hasattr(preprocessor, 'get_feature_info'):
+                    try:
+                        feature_info = preprocessor.get_feature_info()
+                        dataset_info['preprocessor_info'] = feature_info
+                    except:
+                        pass
+            
+            preprocessing_info['datasets'][dataset_name] = dataset_info
+        
+        return preprocessing_info
+    
+    def visualize_flow(self):
+        """
+        Launch the interactive visualization dashboard.
+        Note: This is a placeholder - full implementation would require web interface.
+        """
+        logger.warning("Interactive visualization not yet implemented")
+        logger.info("Model architecture summary:")
+        logger.info(f"  - {len(self.input_dims)} contextual encoders")
+        logger.info(f"  - Input dimensions: {self.input_dims}")
+        logger.info(f"  - Refinement iterations: {self.config.get('architecture', {}).get('refinement_iterations', 3)}")
+        logger.info(f"  - Total parameters: {sum(p.numel() for p in self.model.parameters())}")
+        logger.info(f"  - Preprocessing: {'Available' if self.preprocessors else 'Manual fallback'}")
+        
+        return {
+            'architecture': 'NexusFormer',
+            'num_encoders': len(self.input_dims),
+            'input_dims': self.input_dims,
+            'refinement_iterations': self.config.get('architecture', {}).get('refinement_iterations', 3),
+            'has_preprocessors': bool(self.preprocessors)
+        }
+    
+    def to(self, device: str):
+        """Move model to specified device."""
+        self.device = torch.device(device)
+        self.model = self.model.to(self.device)
+        logger.info(f"Model moved to device: {device}")
+        return self
+    
+    def summary(self) -> str:
+        """Get a human-readable summary of the model."""
+        params = self.get_params()
+        
+        summary = f"""
+NexusFlow Model Summary
+======================
+Model Class: {params['model_class']}
+Total Parameters: {params['total_parameters']:,}
+
+Architecture:
+  - Encoders: {params['architecture']['num_encoders']}
+  - Embedding Dimension: {params['architecture']['embed_dim']}
+  - Refinement Iterations: {params['architecture']['refinement_iterations']}
+  - Input Dimensions: {params['input_dimensions']}
+
+Training Info:
+  - Best Epoch: {params['training_info']['best_epoch']}
+  - Best Validation Metric: {params['training_info']['best_val_metric']:.6f}
+  - Training Complete: {params['training_info']['training_complete']}
+
+Data Info:
+  - Primary Key: {params['datasets_info']['primary_key']}
+  - Target Column: {params['datasets_info']['target_column']}
+  - Datasets: {params['datasets_info']['num_datasets']}
+  - Preprocessors: {params['datasets_info']['has_preprocessors']}"""
+
+        # Add optimization info if available
+        if 'optimization' in params:
+            opt_info = params['optimization']
+            summary += f"""
+
+Optimization Info:
+  - Method: {opt_info['method']}
+  - Size Reduction: {opt_info['size_reduction']:.1%}
+  - Parameter Reduction: {opt_info['parameter_reduction']:.1%}
+  - Original Size: {opt_info['original_size_mb']:.2f} MB
+  - Optimized Size: {opt_info['optimized_size_mb']:.2f} MB"""
+
+        return summary.strip()
+
 
 def extract_pytorch_model(obj):
     """
     Safely extract the actual PyTorch model from any object.
     
     Args:
-        obj: Could be a torch.nn.Module, NexusFlowModelArtifact, or nested artifact
+        obj: Could be a torch.nn.Module, NexusFlowModel, or nested artifact
     
     Returns:
         torch.nn.Module: The actual PyTorch model
@@ -928,17 +838,19 @@ def extract_pytorch_model(obj):
     # If we still don't have a proper model, raise an error
     raise ValueError(f"Could not extract PyTorch model from {type(obj)}")
 
+
 def create_optimized_artifact(original_artifact, optimized_model, optimization_metadata):
     """
-    Create a new artifact with an optimized model.
+    Create a new NexusFlowModel with an optimized model.
+    Maintains backward compatibility with the original function name.
     
     Args:
-        original_artifact: Original NexusFlowModelArtifact
+        original_artifact: Original NexusFlowModel
         optimized_model: Optimized PyTorch model
         optimization_metadata: Metadata about the optimization
     
     Returns:
-        NexusFlowModelArtifact: New artifact with optimized model
+        NexusFlowModel: New model with optimized model
     """
     # Ensure we have the actual PyTorch model
     pytorch_model = extract_pytorch_model(optimized_model)
@@ -947,8 +859,24 @@ def create_optimized_artifact(original_artifact, optimized_model, optimization_m
     new_meta = original_artifact.meta.copy()
     new_meta['optimization'] = optimization_metadata
     
-    # Create new artifact
-    return NexusFlowModelArtifact(pytorch_model, new_meta)
+    # Create new model
+    return NexusFlowModel(pytorch_model, new_meta)
+
+
+def create_optimized_model(original_model, optimized_pytorch_model, optimization_metadata):
+    """
+    Alias for create_optimized_artifact for consistency.
+    
+    Args:
+        original_model: Original NexusFlowModel
+        optimized_pytorch_model: Optimized PyTorch model
+        optimization_metadata: Metadata about the optimization
+    
+    Returns:
+        NexusFlowModel: New model with optimized PyTorch model
+    """
+    return create_optimized_artifact(original_model, optimized_pytorch_model, optimization_metadata)
+
 
 def _create_model_from_meta(meta: Dict[str, Any]) -> nn.Module:
     """Helper function to create model from metadata."""
@@ -995,15 +923,68 @@ def _create_model_from_meta(meta: Dict[str, Any]) -> nn.Module:
     
     return model
 
-# Convenience function for loading .nxf files
-def load_model(path: str) -> NexusFlowModelArtifact:
+
+def load_model(path: str) -> NexusFlowModel:
     """
-    Convenience function to load a NexusFlow model artifact.
+    Load a NexusFlow model from a .nxf file.
+    This is the primary entry point for loading trained models.
     
     Args:
         path: Path to .nxf file
         
     Returns:
-        NexusFlowModelArtifact instance ready for inference
+        NexusFlowModel: Loaded model ready for inference
     """
-    return ModelAPI.load(path)
+    p = Path(path)
+    if not p.exists():
+        logger.error(f"Model file not found: {p}")
+        raise FileNotFoundError(p)
+    
+    # Load checkpoint
+    ckpt = torch.load(p, map_location='cpu', weights_only=False)
+    meta = ckpt.get('meta', {})
+    
+    # Check if this is an optimized model
+    is_optimized = 'optimization' in meta
+    optimization_method = meta.get('optimization', {}).get('method', '')
+    
+    if is_optimized:
+        logger.info(f"Loading optimized model with {optimization_method}")
+        
+        if 'quantization' in optimization_method.lower():
+            # For quantized models, we need to create the model and then apply quantization
+            logger.info("Detected quantized model - applying post-load quantization")
+            
+            # First create the original model structure
+            original_model = _create_model_from_meta(meta)
+            
+            # Apply quantization to get the right structure
+            from torch.quantization import quantize_dynamic
+            quantized_model = quantize_dynamic(
+                original_model, 
+                {nn.Linear}, 
+                dtype=torch.qint8
+            )
+            
+            # Now try to load the quantized state dict
+            try:
+                quantized_model.load_state_dict(ckpt['model_state'], strict=False)
+                logger.info("Successfully loaded quantized model state")
+            except Exception as e:
+                logger.warning(f"Failed to load quantized state: {e}")
+                # Fallback: use the quantized model structure but retrain might be needed
+                logger.info("Using freshly quantized model structure")
+            
+            return NexusFlowModel(quantized_model, meta)
+        
+        elif 'pruning' in optimization_method.lower():
+            # For pruned models, create original model and load state normally
+            model = _create_model_from_meta(meta)
+            model.load_state_dict(ckpt['model_state'])
+            return NexusFlowModel(model, meta)
+    
+    else:
+        # Original unoptimized model
+        model = _create_model_from_meta(meta)
+        model.load_state_dict(ckpt['model_state'])
+        return NexusFlowModel(model, meta)

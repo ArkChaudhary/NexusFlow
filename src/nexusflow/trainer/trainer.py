@@ -11,10 +11,10 @@ import time
 
 from nexusflow.config import ConfigModel
 from nexusflow.model.nexus_former import NexusFormer
-from nexusflow.data.ingestion import load_and_preprocess_datasets, make_dataloaders, flatten_relational_data, load_table, align_datasets
+from nexusflow.data.ingestion import flatten_relational_data, load_table
 from nexusflow.data.dataset import AlignedData
 from nexusflow.data.preprocessor import TabularPreprocessor
-from nexusflow.api.model_api import ModelAPI
+from nexusflow.api.model_api import NexusFlowModel
 
 # Import existing MLOpsLogger from the original trainer
 class MLOpsLogger:
@@ -931,8 +931,8 @@ class Trainer:
                 'join_order': [ds.name for ds in self.cfg.datasets]
             }
         
-        # Create enhanced ModelAPI instance
-        model_api = ModelAPI(model, preprocess_meta=meta)
+        # Create enhanced NexusFlowModel instance
+        model_api = NexusFlowModel(model, preprocess_meta=meta)
         model_api.save(str(path))
         
         logger.info(f"🎁 Relational model artifact created: {path}")
