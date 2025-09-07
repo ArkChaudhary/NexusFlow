@@ -76,56 +76,51 @@ class NexusFlowModel:
     
     def predict(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> np.ndarray:
         """
-        Make predictions on new data with Phase 4 relational aggregation support.
+        Enhanced predict method with Phase 4 multi-table architecture support.
         """
-        logger.info("Making predictions on new data with Phase 4 relational support...")
+        logger.info("Making predictions with Phase 4 multi-table architecture...")
         
-        # Enhanced relational detection based on training logs
-        # Check multiple indicators that this model was trained with relational data
-        
-        # 1. Check if model has preprocessors (indicates Phase 2+ training)
+        # Enhanced relational detection
         has_preprocessors = bool(self.preprocessors)
-        
-        # 2. Check metadata indicators
         relational_features = self.meta.get('relational_features', {})
         has_relational_support = relational_features.get('relational_data_support', False)
-        
-        # 3. Check phase_2_features
         phase_2_features = self.meta.get('phase_2_features', {})
         has_relational_joins = phase_2_features.get('relational_joins', False)
         
-        # 4. Check if config indicates multiple datasets but model expects only 1 input dimension
+        # Check for multi-table architecture indicators
         config_dict = self.meta.get('config', {})
         datasets_config = config_dict.get('datasets', [])
         multiple_datasets = len(datasets_config) > 1
-        single_input_dim = len(self.input_dims) == 1
+        multiple_input_dims = len(self.input_dims) > 1  # NEW: Check for multiple encoders
         
-        # 5. Check for aligned_data_metadata in preprocessing_metadata
+        # Check for aligned_data_metadata in preprocessing_metadata
         preprocessing_metadata = self.meta.get('preprocessing_metadata', {})
         has_aligned_metadata = 'aligned_data_metadata' in preprocessing_metadata
         
-        # Decision logic: Use relational pipeline if ANY of these conditions are true
+        # Enhanced decision logic for multi-table architecture
         should_use_relational = (
             # Core indicators
             (has_relational_support and isinstance(data, dict)) or
             (has_relational_joins and isinstance(data, dict)) or
             (has_aligned_metadata and isinstance(data, dict) and len(data) > 1) or
-            # Strong indicators: multiple datasets in config but single input dimension
-            (multiple_datasets and single_input_dim and isinstance(data, dict) and len(data) > 1) or
+            # NEW: Multiple input dimensions indicates multi-encoder architecture
+            (multiple_input_dims and isinstance(data, dict)) or
+            # Strong indicators: multiple datasets in config
+            (multiple_datasets and isinstance(data, dict) and len(data) > 1) or
             # Preprocessor indicator: has preprocessors and multiple input tables
             (has_preprocessors and isinstance(data, dict) and len(data) > 1)
         )
         
         # Debug logging
-        logger.info(f"Relational detection analysis:")
+        logger.info(f"Multi-table detection analysis:")
         logger.info(f"  - Has preprocessors: {has_preprocessors}")
         logger.info(f"  - Has relational support: {has_relational_support}")
         logger.info(f"  - Has relational joins: {has_relational_joins}")
         logger.info(f"  - Multiple datasets in config: {multiple_datasets}")
-        logger.info(f"  - Single input dimension: {single_input_dim}")
+        logger.info(f"  - Multiple input dimensions: {multiple_input_dims}")  # NEW
         logger.info(f"  - Has aligned metadata: {has_aligned_metadata}")
         logger.info(f"  - Input is multi-table dict: {isinstance(data, dict) and len(data) > 1}")
-        logger.info(f"  - Decision: Use {'RELATIONAL' if should_use_relational else 'STANDARD'} pipeline")
+        logger.info(f"  - Decision: Use {'MULTI-TABLE RELATIONAL' if should_use_relational else 'STANDARD'} pipeline")
         
         if should_use_relational:
             return self._predict_relational_with_aggregation(data)
@@ -370,10 +365,10 @@ class NexusFlowModel:
 
     def _predict_relational_with_aggregation(self, data: Dict[str, pd.DataFrame]) -> np.ndarray:
         """
-        Phase 4 relational prediction with proper aggregation.
-        Uses the same align_relational_data function as training.
+        Phase 4 relational prediction with proper multi-table handling and aggregation.
+        Now supports the new multi-table architecture with separate encoders.
         """
-        logger.info("🔄 Applying Phase 4 relational prediction with aggregation...")
+        logger.info("🔄 Phase 4 multi-table relational prediction with aggregation...")
         
         try:
             # Import here to avoid circular dependencies
@@ -402,95 +397,146 @@ class NexusFlowModel:
             logger.info(f"Processing tables: {list(data_with_csv.keys())}")
             
             # Apply the SAME relational alignment as used in training
-            logger.info("Applying relational alignment for prediction...")
+            logger.info("Applying multi-table relational alignment...")
             aligned_data = align_relational_data(data_with_csv, config)
             
-            # Apply preprocessing if available
+            # Apply per-table preprocessing if available
             if self.preprocessors:
-                aligned_data = self._apply_prediction_preprocessing(aligned_data, config)
+                aligned_data = self._apply_multi_table_preprocessing(aligned_data, config)
             
-            # Get the main expanded table
-            target_table = aligned_data['metadata']['target_table']
-            main_df = aligned_data['aligned_tables'][target_table]
+            # NEW: Extract features from each aligned table separately
+            feature_tensors = []
             
-            logger.info(f"Aligned data shape: {main_df.shape}")
-            logger.info(f"Aligned data columns: {list(main_df.columns)}")
+            # Check if this is true multi-table mode or legacy flattened mode
+            alignment_mode = aligned_data['metadata'].get('alignment_mode', 'legacy')
             
-            # Extract features (exclude system columns)
-            excluded_cols = {'global_id'}
-            target_col = config.target.get('target_column')
-            if target_col and target_col in main_df.columns:
-                excluded_cols.add(target_col)
-            
-            feature_cols = [col for col in main_df.columns if col not in excluded_cols]
-            features_df = main_df[feature_cols].fillna(0)
-            
-            logger.info(f"Features for prediction: {len(feature_cols)} columns, {len(features_df)} rows")
-            logger.info(f"Expected input dims: {self.input_dims}")
-            logger.info(f"Actual feature dimensions: {len(feature_cols)}")
-            
-            # Validate and adjust feature dimensions if necessary
-            expected_features = self.input_dims[0] if len(self.input_dims) > 0 else len(feature_cols)
-            
-            if len(feature_cols) != expected_features:
-                logger.warning(f"Feature dimension mismatch: expected {expected_features}, got {len(feature_cols)}")
-                logger.warning(f"Feature columns: {feature_cols[:10]}...")  # Show first 10
+            if alignment_mode == 'multi_table_preserved' and len(aligned_data['aligned_tables']) > 1:
+                # TRUE multi-table mode: separate tensors for each table
+                logger.info("🎯 Using TRUE multi-table architecture")
                 
-                # Try to match features by selecting the expected number
-                if len(feature_cols) > expected_features:
-                    logger.info(f"Truncating features from {len(feature_cols)} to {expected_features}")
-                    feature_cols = feature_cols[:expected_features]
-                    features_df = features_df[feature_cols]
-                elif len(feature_cols) < expected_features:
-                    logger.error(f"Not enough features: need {expected_features}, have {len(feature_cols)}")
-                    # Pad with zeros
-                    missing_features = expected_features - len(feature_cols)
-                    for i in range(missing_features):
-                        features_df[f'padded_feature_{i}'] = 0.0
-                    logger.info(f"Padded with {missing_features} zero features")
+                target_col = config.target.get('target_column')
+                
+                for table_name, table_df in aligned_data['aligned_tables'].items():
+                    logger.info(f"Processing table: {table_name} (shape: {table_df.shape})")
+                    
+                    # Extract features (exclude system columns)
+                    excluded_cols = {'global_id'}
+                    if target_col and target_col in table_df.columns:
+                        excluded_cols.add(target_col)
+                    
+                    feature_cols = [col for col in table_df.columns if col not in excluded_cols]
+                    
+                    if feature_cols:
+                        features_df = table_df[feature_cols].fillna(0)
+                        feature_tensor = torch.tensor(features_df.values.astype(np.float32))
+                        feature_tensors.append(feature_tensor)
+                        logger.info(f"  {table_name}: {feature_tensor.shape}")
+                    else:
+                        # Empty table - add zero tensor
+                        feature_tensors.append(torch.zeros(len(table_df), 1, dtype=torch.float32))
+                        logger.info(f"  {table_name}: empty features, using zeros")
+                
+                # Validate input dimensions
+                if len(feature_tensors) != len(self.input_dims):
+                    logger.warning(f"Dimension mismatch: expected {len(self.input_dims)} tables, got {len(feature_tensors)}")
+                    
+                    # Adjust if needed
+                    while len(feature_tensors) < len(self.input_dims):
+                        feature_tensors.append(torch.zeros(feature_tensors[0].size(0), 1, dtype=torch.float32))
+                    
+                    feature_tensors = feature_tensors[:len(self.input_dims)]
+                
+                # Validate feature dimensions match expected
+                for i, (tensor, expected_dim) in enumerate(zip(feature_tensors, self.input_dims)):
+                    if tensor.size(-1) != expected_dim:
+                        logger.warning(f"Table {i} feature dim mismatch: {tensor.size(-1)} vs {expected_dim}")
+                        
+                        if tensor.size(-1) > expected_dim:
+                            # Truncate
+                            feature_tensors[i] = tensor[:, :expected_dim]
+                        elif tensor.size(-1) < expected_dim:
+                            # Pad with zeros
+                            padding = torch.zeros(tensor.size(0), expected_dim - tensor.size(-1))
+                            feature_tensors[i] = torch.cat([tensor, padding], dim=1)
+                
+            else:
+                # Legacy mode: single flattened table
+                logger.info("Using legacy flattened table mode")
+                
+                target_table = aligned_data['metadata']['target_table']
+                main_df = aligned_data['aligned_tables'][target_table]
+                
+                # Extract features from flattened table
+                excluded_cols = {'global_id'}
+                target_col = config.target.get('target_column')
+                if target_col and target_col in main_df.columns:
+                    excluded_cols.add(target_col)
+                
+                feature_cols = [col for col in main_df.columns if col not in excluded_cols]
+                features_df = main_df[feature_cols].fillna(0)
+                
+                # Split features according to input dimensions (legacy behavior)
+                start_idx = 0
+                for dim in self.input_dims:
+                    end_idx = start_idx + dim
+                    if end_idx <= len(feature_cols):
+                        subset_features = features_df.iloc[:, start_idx:end_idx]
+                        feature_tensor = torch.tensor(subset_features.values.astype(np.float32))
+                    else:
+                        # Pad if not enough features
+                        subset_features = features_df.iloc[:, start_idx:]
+                        if subset_features.shape[1] < dim:
+                            padding_cols = dim - subset_features.shape[1]
+                            padding = pd.DataFrame(0.0, index=subset_features.index, 
+                                                columns=[f'pad_{i}' for i in range(padding_cols)])
+                            subset_features = pd.concat([subset_features, padding], axis=1)
+                        
+                        feature_tensor = torch.tensor(subset_features.values.astype(np.float32))
+                    
+                    feature_tensors.append(feature_tensor)
+                    start_idx = end_idx
             
-            # Convert to tensors
-            feature_tensor = torch.tensor(features_df.values.astype(np.float32))
-            logger.info(f"Feature tensor shape: {feature_tensor.shape}")
+            # Create key features tensor for any table that has global_id
+            main_table = list(aligned_data['aligned_tables'].values())[0]  # Use first table for keys
             
-            # Create key features tensor (global_id + other key columns)
             key_cols = ['global_id']
-            for col in main_df.columns:
+            for col in main_table.columns:
                 if any(keyword in col.lower() for keyword in ['_id', 'key', 'pk', 'fk']) and col != 'global_id':
                     key_cols.append(col)
+                    break  # Only take one additional key column
             
             logger.info(f"Key columns: {key_cols}")
             
-            if len(key_cols) > 1:
-                key_data = []
-                for col in key_cols:
-                    if col == 'global_id':
-                        # Convert global_id to hash for numerical processing
-                        key_data.append([hash(str(val)) % (2**31) for val in main_df[col]])
-                    else:
-                        # Handle other key columns
-                        col_data = []
-                        for val in main_df[col]:
-                            if pd.isna(val):
-                                col_data.append(0.0)
-                            elif isinstance(val, (int, float)):
-                                col_data.append(float(val))
-                            else:
-                                col_data.append(float(hash(str(val)) % (2**31)))
-                        key_data.append(col_data)
-                
+            key_data = []
+            for col in key_cols:
+                if col == 'global_id':
+                    # Convert global_id to hash for numerical processing
+                    key_data.append([hash(str(val)) % (2**31) for val in main_table[col]])
+                else:
+                    # Handle other key columns
+                    col_data = []
+                    for val in main_table[col]:
+                        if pd.isna(val):
+                            col_data.append(0.0)
+                        elif isinstance(val, (int, float)):
+                            col_data.append(float(val))
+                        else:
+                            col_data.append(float(hash(str(val)) % (2**31)))
+                    key_data.append(col_data)
+            
+            if len(key_data) > 1:
                 key_tensor = torch.tensor(np.array(key_data).T, dtype=torch.float32)
             else:
-                # Only global_id
-                key_data = [hash(str(val)) % (2**31) for val in main_df['global_id']]
-                key_tensor = torch.tensor(key_data, dtype=torch.float32).unsqueeze(1)
+                key_tensor = torch.tensor(key_data[0], dtype=torch.float32).unsqueeze(1)
             
-            logger.info(f"Key tensor shape: {key_tensor.shape}")
+            logger.info(f"Feature tensors: {[t.shape for t in feature_tensors]}")
+            logger.info(f"Key tensor: {key_tensor.shape}")
             
-            # Run model prediction
+            # Run model prediction with multiple feature tensors
             self.model.eval()
             with torch.no_grad():
-                predictions = self.model([feature_tensor], key_features=key_tensor)
+                # Pass multiple feature tensors to the multi-encoder model
+                predictions = self.model(feature_tensors, key_features=key_tensor)
             
             # Convert to numpy
             predictions_np = predictions.cpu().numpy()
@@ -508,51 +554,38 @@ class NexusFlowModel:
             if 'key_map' in aligned_data and len(aligned_data['key_map']) > 0:
                 key_map_df = aligned_data['key_map']
                 logger.info(f"Key map shape: {key_map_df.shape}")
-                logger.info(f"Key map columns: {list(key_map_df.columns)}")
                 
                 # Create aggregation mapping
                 aggregation_df = pd.DataFrame({
-                    'global_id': main_df['global_id'].values,
-                    'prediction': predictions_np
+                    'global_id': main_table['global_id'].values,
+                    'prediction': predictions_np.flatten() if predictions_np.ndim > 1 else predictions_np
                 })
-                
-                logger.info(f"Aggregation df shape: {aggregation_df.shape}")
                 
                 # Merge with key_map to get original keys
                 merged_df = aggregation_df.merge(key_map_df, on='global_id', how='left')
-                logger.info(f"Merged df shape: {merged_df.shape}")
-                logger.info(f"Merged df columns: {list(merged_df.columns)}")
                 
                 # Find the primary key column for the target table
                 target_dataset_config = None
-                target_table_clean = target_table.replace('.csv', '')
+                target_table_name = aligned_data['metadata']['target_table']
+                target_table_clean = target_table_name.replace('.csv', '')
                 
                 for ds_config in config.datasets:
-                    if ds_config.name == target_table_clean:
+                    if ds_config.name == target_table_clean or ds_config.name == target_table_name:
                         target_dataset_config = ds_config
                         break
                 
                 if target_dataset_config and target_dataset_config.primary_key:
                     primary_key = target_dataset_config.primary_key
-                    if isinstance(primary_key, list):
-                        primary_key_name = primary_key[0]
-                    else:
-                        primary_key_name = primary_key
+                    primary_key_name = primary_key[0] if isinstance(primary_key, list) else primary_key
                     
                     # Look for the primary key column in merged_df
                     possible_key_cols = [
-                        f"{target_table}_{primary_key_name}",
+                        f"{target_table_name}_{primary_key_name}",
                         f"{target_table_clean}_{primary_key_name}",
-                        primary_key_name,
-                        f"users.csv_{primary_key_name}",  # specific for this case
-                        f"users_{primary_key_name}"
+                        primary_key_name
                     ]
                     
                     available_key_cols = [col for col in possible_key_cols if col in merged_df.columns]
-                    
-                    logger.info(f"Looking for primary key: {primary_key_name}")
-                    logger.info(f"Possible columns: {possible_key_cols}")
-                    logger.info(f"Available columns: {available_key_cols}")
                     
                     if available_key_cols:
                         key_col = available_key_cols[0]
@@ -564,20 +597,56 @@ class NexusFlowModel:
                         
                         logger.info(f"✅ Aggregated {len(predictions_np)} expanded predictions to {len(final_predictions)} final predictions")
                         return final_predictions
-                    else:
-                        logger.warning(f"Primary key column not found. Available columns: {list(merged_df.columns)}")
-                else:
-                    logger.warning("No primary key configuration found for aggregation")
             
             # Fallback: return raw predictions if aggregation fails
             logger.warning("⚠️ Could not perform prediction aggregation, returning raw predictions")
-            return predictions_np
+            return predictions_np.flatten() if predictions_np.ndim > 1 else predictions_np
             
         except Exception as e:
-            logger.error(f"Relational prediction failed: {e}")
+            logger.error(f"Multi-table relational prediction failed: {e}")
             logger.exception("Full error details:")
             logger.info("Falling back to standard prediction pipeline")
             return self._predict_standard(data)
+    
+    def _apply_multi_table_preprocessing(self, aligned_data, config):
+        """Apply per-table preprocessing to aligned data for prediction."""
+        logger.info("Applying per-table preprocessing for prediction...")
+        
+        for table_name, table_df in aligned_data['aligned_tables'].items():
+            table_name_clean = table_name.replace('.csv', '')
+            
+            if table_name in self.preprocessors or table_name_clean in self.preprocessors:
+                preprocessor_key = table_name if table_name in self.preprocessors else table_name_clean
+                preprocessor = self.preprocessors[preprocessor_key]
+                
+                logger.info(f"Applying trained preprocessor to {table_name}")
+                
+                # Exclude system columns
+                excluded_cols = {'global_id'}
+                target_col = config.target.get('target_column')
+                if target_col and target_col in table_df.columns:
+                    excluded_cols.add(target_col)
+                
+                feature_df = table_df.drop(columns=excluded_cols, errors='ignore')
+                
+                if not feature_df.empty:
+                    try:
+                        processed_features = preprocessor.transform(feature_df)
+                        final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+                        processed_df = processed_features[final_cols].copy()
+                        
+                        # Add back excluded columns
+                        for col in excluded_cols:
+                            if col in table_df.columns:
+                                processed_df[col] = table_df[col].values
+                        
+                        aligned_data['aligned_tables'][table_name] = processed_df
+                        logger.info(f"✅ Preprocessed {table_name}: {len(final_cols)} features")
+                        
+                    except Exception as e:
+                        logger.warning(f"Preprocessing failed for {table_name}: {e}")
+        
+        return aligned_data
 
     def _predict_standard(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> np.ndarray:
         """Standard prediction pipeline (original logic)."""

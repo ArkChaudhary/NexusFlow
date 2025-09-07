@@ -16,15 +16,14 @@ import uuid
 
 def align_relational_data(datasets: Dict[str, pd.DataFrame], cfg: ConfigModel) -> AlignedData:
     """
-    True relational alignment with global_id and row expansion.
+    True relational alignment that produces multiple aligned but separate tables.
     
-    This function performs proper relational joins without data loss,
-    expanding the target table as needed for one-to-many relationships.
+    This function performs proper relational joins without merging features,
+    creating aligned tables that maintain separate feature spaces.
     """
-    logger.info("🔗 Starting true relational alignment with global_id...")
+    logger.info("🔗 Starting true multi-table relational alignment...")
     
     if cfg.training.use_synthetic or not cfg.datasets:
-        # Fallback for synthetic data
         return _create_fallback_aligned_data(datasets)
     
     # Step 1: Identify target table and build dependency graph
@@ -51,68 +50,141 @@ def align_relational_data(datasets: Dict[str, pd.DataFrame], cfg: ConfigModel) -
             key_map_entry[f'{target_table_name}_{pk_col}'] = row[pk_col]
         key_map_data.append(key_map_entry)
     
-    # Step 3: Build join graph and determine join order
-    join_graph = _build_join_dependency_graph(cfg.datasets)
-    join_order = _determine_join_order(join_graph, target_table_name)
+    # Step 3: Calculate expansion requirements from one-to-many joins
+    expansion_map = {}  # Maps global_id to how many times it should be replicated
+    join_info = {}     # Stores join details for each table
     
-    # Step 4: Perform sequential joins with row expansion
-    aligned_tables = {target_table_name: base_df}
-    join_stats = {'total_expansions': 0, 'join_operations': []}
-    
-    for table_name in join_order:
+    for table_name in datasets:
         if table_name == target_table_name:
             continue
             
         table_df = datasets[table_name].copy()
-        dataset_config = next(d for d in cfg.datasets if d.name == table_name)
+        dataset_config = next((d for d in cfg.datasets if d.name == table_name), None)
+        if not dataset_config or not dataset_config.foreign_keys:
+            continue
         
-        # Find the foreign key that connects to already joined tables
+        # Find foreign key connecting to target table
         connecting_fk = None
-        for fk in dataset_config.foreign_keys or []:
-            if fk.references_table in aligned_tables:
+        for fk in dataset_config.foreign_keys:
+            if fk.references_table == target_table_name:
                 connecting_fk = fk
                 break
         
         if not connecting_fk:
-            logger.warning(f"No connection found for {table_name}, skipping")
             continue
         
-        # Perform the join with row expansion
-        expanded_result, expansion_stats = _perform_expansion_join(
-            aligned_tables[connecting_fk.references_table],
-            table_df,
-            connecting_fk,
-            table_name
-        )
+        # Calculate expansion requirements
+        fk_cols = connecting_fk.columns if isinstance(connecting_fk.columns, list) else [connecting_fk.columns]
+        ref_cols = connecting_fk.references_columns if isinstance(connecting_fk.references_columns, list) else [connecting_fk.references_columns]
         
-        # Update key mapping for new rows
-        _update_key_mapping(key_map_data, expanded_result, table_name, dataset_config)
+        # Count how many related records each base record has
+        join_counts = table_df.groupby(fk_cols).size().to_dict()
         
-        aligned_tables[connecting_fk.references_table] = expanded_result
-        join_stats['total_expansions'] += expansion_stats['expansions']
-        join_stats['join_operations'].append({
-            'table': table_name,
-            'type': expansion_stats['join_type'],
-            'expansions': expansion_stats['expansions']
-        })
+        # Map to base table records
+        for _, base_row in base_df.iterrows():
+            base_key = tuple(base_row[col] for col in ref_cols) if len(ref_cols) > 1 else base_row[ref_cols[0]]
+            count = join_counts.get(base_key, 0)
+            
+            global_id = base_row['global_id']
+            if global_id not in expansion_map:
+                expansion_map[global_id] = 1
+            expansion_map[global_id] = max(expansion_map[global_id], count)
         
-        logger.info(f"✅ Joined {table_name}: {expansion_stats['expansions']} row expansions")
+        join_info[table_name] = {
+            'fk_config': connecting_fk,
+            'table_df': table_df,
+            'fk_cols': fk_cols,
+            'ref_cols': ref_cols
+        }
     
-    # Step 5: Create final key mapping DataFrame
-    key_map_df = pd.DataFrame(key_map_data)
+    # Step 4: Create aligned tables with proper row expansion
+    aligned_tables = {}
+    total_expansions = 0
     
-    logger.info(f"🎯 Relational alignment complete:")
-    logger.info(f"   Total row expansions: {join_stats['total_expansions']}")
-    logger.info(f"   Final base table size: {len(aligned_tables[target_table_name])}")
-    logger.info(f"   Joined tables: {len(join_stats['join_operations'])}")
+    # Expand base table first
+    expanded_base_rows = []
+    for _, base_row in base_df.iterrows():
+        global_id = base_row['global_id']
+        expansion_count = expansion_map.get(global_id, 1)
+        
+        for i in range(expansion_count):
+            expanded_row = base_row.copy()
+            expanded_row['_row_index'] = i  # Track which expansion this is
+            expanded_base_rows.append(expanded_row)
+        
+        if expansion_count > 1:
+            total_expansions += expansion_count - 1
+    
+    expanded_base_df = pd.DataFrame(expanded_base_rows).reset_index(drop=True)
+    aligned_tables[target_table_name] = expanded_base_df
+    
+    # Create aligned versions of other tables
+    for table_name, info in join_info.items():
+        table_df = info['table_df']
+        fk_cols = info['fk_cols']
+        ref_cols = info['ref_cols']
+        
+        # Create aligned version by matching to expanded base table
+        aligned_rows = []
+        
+        for _, expanded_base_row in expanded_base_df.iterrows():
+            global_id = expanded_base_row['global_id']
+            row_index = expanded_base_row['_row_index']
+            
+            # Find matching records in the related table
+            base_key = tuple(expanded_base_row[col] for col in ref_cols) if len(ref_cols) > 1 else expanded_base_row[ref_cols[0]]
+            matching_records = table_df[
+                (table_df[fk_cols] == base_key).all(axis=1) if len(fk_cols) > 1 
+                else table_df[fk_cols[0]] == base_key
+            ]
+            
+            if len(matching_records) > row_index:
+                # Use the specific record for this row index
+                selected_record = matching_records.iloc[row_index].copy()
+            elif len(matching_records) > 0:
+                # Use the last available record if we've run out
+                selected_record = matching_records.iloc[-1].copy()
+            else:
+                # Create null record if no matches
+                selected_record = pd.Series({col: None for col in table_df.columns})
+            
+            # Add global_id to maintain alignment
+            selected_record['global_id'] = global_id
+            aligned_rows.append(selected_record)
+        
+        aligned_table_df = pd.DataFrame(aligned_rows).reset_index(drop=True)
+        aligned_tables[table_name] = aligned_table_df
+    
+    # Clean up temporary columns
+    if '_row_index' in aligned_tables[target_table_name].columns:
+        aligned_tables[target_table_name] = aligned_tables[target_table_name].drop(columns=['_row_index'])
+    
+    # Step 5: Update key mapping for expanded structure
+    expanded_key_map_data = []
+    for _, row in expanded_base_df.iterrows():
+        key_entry = {'global_id': row['global_id'], 'source_table': target_table_name}
+        for pk_col in target_pk_cols:
+            key_entry[f'{target_table_name}_{pk_col}'] = row[pk_col]
+        expanded_key_map_data.append(key_entry)
+    
+    key_map_df = pd.DataFrame(expanded_key_map_data)
+    
+    logger.info(f"🎯 Multi-table relational alignment complete:")
+    logger.info(f"   Total row expansions: {total_expansions}")
+    logger.info(f"   Target table final size: {len(aligned_tables[target_table_name])}")
+    logger.info(f"   Aligned tables: {list(aligned_tables.keys())}")
     
     return AlignedData(
         aligned_tables=aligned_tables,
         key_map=key_map_df,
         metadata={
             'target_table': target_table_name,
-            'join_stats': join_stats,
-            'original_sizes': {name: len(df) for name, df in datasets.items()}
+            'join_stats': {
+                'total_expansions': total_expansions,
+                'join_operations': list(join_info.keys())
+            },
+            'original_sizes': {name: len(df) for name, df in datasets.items()},
+            'alignment_mode': 'multi_table_preserved'
         }
     )
 

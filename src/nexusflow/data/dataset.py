@@ -56,46 +56,81 @@ class NexusFlowDataset(Dataset):
         logger.info(f"  Feature columns: {len(self.feature_cols)}")
         logger.info(f"  Key feature columns: {len(self.key_feature_cols)}")
 
-    def _calculate_feature_dimensions(self) -> List[int]:
-        """Calculate feature dimensions for backward compatibility."""
-        # For now, return single dimension representing all features
-        return [len(self.feature_cols)]
-
     def __len__(self):
         return len(self.main_df)
 
     def __getitem__(self, idx) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
-        Returns features, key_features, and target for a single sample.
+        Returns separate feature tensors for each table, key_features, and target.
         
         Returns:
             Tuple of (feature_tensors_list, key_features_tensor, target_tensor)
         """
-        row = self.main_df.iloc[idx]
+        # Get the main table row first
+        main_row = self.main_df.iloc[idx]
+        global_id = main_row['global_id']
         
-        # Extract regular features
-        features = torch.tensor(row[self.feature_cols].values.astype('float32'))
+        # Extract features from each aligned table separately
+        feature_tensors = []
+        
+        # Process each aligned table
+        for table_name, table_df in self.aligned_data['aligned_tables'].items():
+            # Find the corresponding row in this table by global_id
+            matching_rows = table_df[table_df['global_id'] == global_id]
+            
+            if len(matching_rows) == 0:
+                # Create zero tensor if no matching row
+                table_feature_count = len([col for col in table_df.columns 
+                                        if col not in [self.target_col, 'global_id']])
+                features = torch.zeros(table_feature_count, dtype=torch.float32)
+            else:
+                # Use the first matching row
+                table_row = matching_rows.iloc[0]
+                
+                # Get feature columns for this table (exclude target and global_id)
+                table_feature_cols = [col for col in table_df.columns 
+                                    if col not in [self.target_col, 'global_id']]
+                
+                if table_feature_cols:
+                    # Fill NaNs and convert to tensor
+                    feature_values = table_row[table_feature_cols].fillna(0).values.astype('float32')
+                    features = torch.tensor(feature_values)
+                else:
+                    # Empty feature tensor if no features in this table
+                    features = torch.zeros(0, dtype=torch.float32)
+            
+            feature_tensors.append(features)
         
         # Extract key features (global_id and relational keys)
         key_features = []
         for col in self.key_feature_cols:
             if col == 'global_id':
                 # Convert global_id to hash for numerical processing
-                key_features.append(hash(row[col]) % (2**31))
+                key_features.append(hash(main_row[col]) % (2**31))
             else:
                 # Handle other key columns
-                val = row[col] if not pd.isna(row[col]) else 0
+                val = main_row[col] if not pd.isna(main_row[col]) else 0
                 key_features.append(float(val) if isinstance(val, (int, float)) else hash(str(val)) % (2**31))
         
         key_features_tensor = torch.tensor(key_features, dtype=torch.float32)
         
         # Extract target
-        target = torch.tensor(row[self.target_col], dtype=self.target_dtype)
+        target = torch.tensor(main_row[self.target_col], dtype=self.target_dtype)
         
-        # Return as list for backward compatibility with MultiTableDataLoader
-        feature_list = [features]  # Single table for now
+        return feature_tensors, key_features_tensor, target
+
+    def _calculate_feature_dimensions(self) -> List[int]:
+        """Calculate feature dimensions for each table separately."""
+        dimensions = []
         
-        return feature_list, key_features_tensor, target
+        for table_name, table_df in self.aligned_data['aligned_tables'].items():
+            # Count feature columns (exclude target and global_id)
+            feature_count = len([col for col in table_df.columns 
+                            if col not in [self.target_col, 'global_id']])
+            dimensions.append(feature_count)
+        
+        logger.debug(f"Feature dimensions per table: {dimensions}")
+        return dimensions
 
 class MultiTableDataLoader:
     """

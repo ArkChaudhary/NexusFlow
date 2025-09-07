@@ -183,122 +183,139 @@ class Trainer:
             from nexusflow.data.ingestion import align_relational_data
             self.aligned_data = align_relational_data(raw_datasets, self.cfg)
             
-            # Apply preprocessing to aligned data if enabled
+            # Apply per-table preprocessing if enabled
             if training_cfg.use_advanced_preprocessing:
                 self.aligned_data = self._apply_preprocessing_to_aligned_data(self.aligned_data)
-                # preprocessors are set in _apply_preprocessing_to_aligned_data
             else:
                 self.preprocessors = {}
             
-            # Calculate input dimensions from the main expanded table
-            main_table = self.aligned_data['aligned_tables'][self.aligned_data['metadata']['target_table']]
+            # Calculate input dimensions from each aligned table separately
+            self.input_dims = []
             target_col = self.cfg.target.get('target_column')
-            excluded_cols = {'global_id', target_col} if target_col else {'global_id'}
             
-            feature_cols = [col for col in main_table.columns if col not in excluded_cols]
-            self.input_dims = [len(feature_cols)]  # Single expanded table
+            for table_name, table_df in self.aligned_data['aligned_tables'].items():
+                excluded_cols = {'global_id', target_col} if target_col else {'global_id'}
+                feature_cols = [col for col in table_df.columns if col not in excluded_cols]
+                self.input_dims.append(len(feature_cols))
             
-            logger.info(f"📈 TRUE relational alignment complete:")
-            logger.info(f"   Target table: {self.aligned_data['metadata']['target_table']}")
-            logger.info(f"   Expanded table size: {len(main_table):,} rows")
-            logger.info(f"   Feature columns: {len(feature_cols)}")
+            logger.info(f"📈 TRUE multi-table alignment complete:")
+            logger.info(f"   Aligned tables: {list(self.aligned_data['aligned_tables'].keys())}")
+            logger.info(f"   Input dimensions: {self.input_dims}")
+            logger.info(f"   Total tables: {len(self.input_dims)}")
             
             join_stats = self.aligned_data['metadata'].get('join_stats', {})
             logger.info(f"   Row expansions: {join_stats.get('total_expansions', 0)}")
-            logger.info(f"   Join operations: {len(join_stats.get('join_operations', []))}")
 
     def _apply_preprocessing_to_aligned_data(self, aligned_data: AlignedData) -> AlignedData:
-        """Apply preprocessing to the aligned relational data."""
-        logger.info("🔄 Applying preprocessing to aligned data...")
+        """Apply per-table preprocessing to aligned relational data."""
+        logger.info("🔄 Applying per-table preprocessing to aligned data...")
         
-        main_table_name = aligned_data['metadata']['target_table']
-        main_df = aligned_data['aligned_tables'][main_table_name].copy()
+        aligned_tables = aligned_data['aligned_tables'].copy()
+        preprocessors = {}
         
-        # Create single preprocessor for the expanded table
-        from nexusflow.data.preprocessor import TabularPreprocessor
-        preprocessor = TabularPreprocessor()
-        
-        # Exclude target and system columns
+        # Get target column for exclusion
         target_col = self.cfg.target.get('target_column')
-        excluded_cols = {'global_id'}
-        if target_col:
-            excluded_cols.add(target_col)
         
-        feature_df = main_df.drop(columns=excluded_cols, errors='ignore')
-        
-        # Auto-detect or use configured column types
-        categorical_cols = []
-        numerical_cols = []
-        
-        # Aggregate column type info from original dataset configs
-        for dataset_cfg in self.cfg.datasets:
-            if dataset_cfg.categorical_columns:
-                categorical_cols.extend([col for col in dataset_cfg.categorical_columns if col in feature_df.columns])
-            if dataset_cfg.numerical_columns:
-                numerical_cols.extend([col for col in dataset_cfg.numerical_columns if col in feature_df.columns])
-        
-        # Auto-detect remaining columns
-        if self.cfg.training.auto_detect_types:
-            remaining_cols = [col for col in feature_df.columns 
-                            if col not in categorical_cols and col not in numerical_cols]
+        # Process each table separately
+        for table_name, table_df in aligned_tables.items():
+            logger.info(f"Processing table: {table_name}")
             
-            for col in remaining_cols:
-                if feature_df[col].dtype in ['object', 'category', 'bool']:
-                    categorical_cols.append(col)
-                elif pd.api.types.is_numeric_dtype(feature_df[col]):
-                    numerical_cols.append(col)
-        
-        # Fit and transform
-        if categorical_cols or numerical_cols:
-            preprocessor.fit(feature_df, categorical_cols, numerical_cols)
-            processed_features = preprocessor.transform(feature_df)
+            # Find corresponding dataset config
+            dataset_config = None
+            for ds_cfg in self.cfg.datasets:
+                if ds_cfg.name == table_name:
+                    dataset_config = ds_cfg
+                    break
             
-            # Reconstruct the main table with processed features
-            final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
-            processed_df = processed_features[final_cols].copy()
+            if not dataset_config:
+                logger.warning(f"No config found for table {table_name}, skipping preprocessing")
+                continue
             
-            # Add back excluded columns
+            # Exclude system columns and target from preprocessing
+            excluded_cols = {'global_id'}
+            if target_col and target_col in table_df.columns:
+                excluded_cols.add(target_col)
+            
+            # Get feature columns for this table
+            feature_df = table_df.copy()
             for col in excluded_cols:
-                if col in main_df.columns:
-                    processed_df[col] = main_df[col].values
+                if col in feature_df.columns:
+                    feature_df = feature_df.drop(columns=[col])
             
-            # Update aligned data
-            aligned_data['aligned_tables'][main_table_name] = processed_df
-            aligned_data['metadata']['preprocessing_applied'] = True
+            if feature_df.empty:
+                logger.info(f"No features to process in table {table_name}")
+                continue
             
-            # Store preprocessor for later use
-            self.preprocessors = {main_table_name: preprocessor}
+            # Create table-specific preprocessor
+            from nexusflow.data.preprocessor import TabularPreprocessor
+            preprocessor = TabularPreprocessor()
             
-            logger.info(f"✅ Preprocessing applied to expanded table: {len(final_cols)} features")
-        else:
-            logger.info("⚠️ No features found for preprocessing")
-            self.preprocessors = {}
+            # Get column type information
+            categorical_cols = dataset_config.categorical_columns or []
+            numerical_cols = dataset_config.numerical_columns or []
+            
+            # Filter to only columns that exist in this table
+            categorical_cols = [col for col in categorical_cols if col in feature_df.columns]
+            numerical_cols = [col for col in numerical_cols if col in feature_df.columns]
+            
+            # Auto-detect remaining columns if enabled
+            if self.cfg.training.auto_detect_types:
+                remaining_cols = [col for col in feature_df.columns 
+                                if col not in categorical_cols and col not in numerical_cols]
+                
+                for col in remaining_cols:
+                    if feature_df[col].dtype in ['object', 'category', 'bool']:
+                        categorical_cols.append(col)
+                    elif pd.api.types.is_numeric_dtype(feature_df[col]):
+                        numerical_cols.append(col)
+            
+            # Fit and transform if we have features to process
+            if categorical_cols or numerical_cols:
+                preprocessor.fit(feature_df, categorical_cols, numerical_cols)
+                processed_features = preprocessor.transform(feature_df)
+                
+                # Reconstruct table with processed features
+                final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+                processed_df = processed_features[final_cols].copy()
+                
+                # Add back excluded columns
+                for col in excluded_cols:
+                    if col in table_df.columns:
+                        processed_df[col] = table_df[col].values
+                
+                # Update the aligned table
+                aligned_tables[table_name] = processed_df
+                preprocessors[table_name] = preprocessor
+                
+                logger.info(f"✅ Processed {table_name}: {len(final_cols)} features")
+            else:
+                logger.info(f"⚠️ No features to process in {table_name}")
         
+        # Store preprocessors for later use
+        self.preprocessors = preprocessors
+        
+        # Update aligned data with processed tables
+        aligned_data['aligned_tables'] = aligned_tables
+        aligned_data['metadata']['preprocessing_applied'] = True
+        aligned_data['metadata']['preprocessed_tables'] = list(preprocessors.keys())
+        
+        logger.info(f"🎯 Per-table preprocessing complete: {len(preprocessors)} tables processed")
         return aligned_data
 
     def _initialize_preprocessing_aware_model(self):
-        """Initialize model with preprocessing awareness."""
-        embed_dim = self.cfg.architecture.global_embed_dim  # Direct attribute access
-        refinement_iterations = self.cfg.architecture.refinement_iterations  # Direct attribute access
+        """Initialize model with multiple encoders for each table."""
+        embed_dim = self.cfg.architecture.global_embed_dim
+        refinement_iterations = self.cfg.architecture.refinement_iterations
         
-        # Determine encoder strategy based on preprocessing
-        if self.cfg.datasets:
-            transformer_types = {d.transformer_type for d in self.cfg.datasets}
-            if len(transformer_types) == 1:
-                encoder_type = list(transformer_types)[0]
-            else:
-                encoder_type = 'standard'
-        else:
-            encoder_type = 'standard'
-        
+        # CRITICAL: Pass list of dimensions to enable multiple encoders
         self.model = NexusFormer(
-            input_dims=self.input_dims,
+            input_dims=self.input_dims,  # This is now a list with multiple dimensions
             embed_dim=embed_dim,
             refinement_iterations=refinement_iterations,
-            encoder_type=encoder_type,
-            use_moe=self.cfg.architecture.use_moe,  # Direct attribute access
-            num_experts=self.cfg.architecture.num_experts,  # Direct attribute access
-            use_flash_attn=self.cfg.architecture.use_flash_attn  # Direct attribute access
+            encoder_type='standard',
+            use_moe=self.cfg.architecture.use_moe,
+            num_experts=self.cfg.architecture.num_experts,
+            use_flash_attn=self.cfg.architecture.use_flash_attn
         ).to(self.device)
         
         # Store preprocessing information in model for inference
@@ -306,13 +323,20 @@ class Trainer:
             self.model._preprocessing_metadata = {
                 'preprocessors': self.preprocessors,
                 'input_dims': self.input_dims,
-                'datasets_config': [d.dict() for d in self.cfg.datasets]
+                'datasets_config': [d.dict() for d in self.cfg.datasets],
+                'aligned_data_schema': {
+                    'table_names': list(self.aligned_data['aligned_tables'].keys()),
+                    'target_table': self.aligned_data['metadata']['target_table']
+                }
             }
         
-        logger.info(f"🧠 Enhanced model initialized: {encoder_type} encoders")
+        logger.info(f"🧠 Multi-encoder model initialized:")
+        logger.info(f"   Encoders: {len(self.input_dims)} (one per table)")
+        logger.info(f"   Input dimensions: {self.input_dims}")
+        logger.info(f"   Cross-context attention: ENABLED")
         logger.info(f"   Advanced features: MoE={self.cfg.architecture.use_moe}, "
                     f"FlashAttn={self.cfg.architecture.use_flash_attn}")
-        logger.info(f"   Preprocessing: {'integrated' if self.preprocessors else 'legacy'}")
+        logger.info(f"   Preprocessing: {'per-table' if self.preprocessors else 'legacy'}")
 
     def _setup_optimizer(self):
         """Setup optimizer with enhanced features."""
@@ -850,7 +874,7 @@ class Trainer:
             logger.info(f"💾 Saved preprocessing metadata: {metadata_path}")
 
     def _save_enhanced_model(self, path: Path):
-        """Save enhanced model with preprocessing information."""
+        """Save enhanced model checkpoint with multi-table metadata."""
         if self.best_model_state is None:
             logger.warning("No best model state to save")
             return
@@ -864,15 +888,24 @@ class Trainer:
             'input_dims': self.input_dims,
             'best_val_metric': self.best_val_metric,
             'training_complete': True,
+            
+            # Multi-table architecture metadata
+            'multi_table_metadata': {
+                'num_encoders': len(self.input_dims),
+                'separate_tables': len(set(self.aligned_data['aligned_tables'].keys())) if self.aligned_data else 0,
+                'alignment_mode': getattr(self.aligned_data['metadata'], 'alignment_mode', 'synthetic') if self.aligned_data else 'synthetic',
+                'total_expansions': self.aligned_data['metadata'].get('join_stats', {}).get('total_expansions', 0) if self.aligned_data else 0
+            },
+            
             'preprocessing_enabled': bool(self.preprocessors),
             'preprocessing_metadata': self.preprocessing_metadata
         }
         
         torch.save(enhanced_checkpoint, path)
-        logger.info(f"Enhanced model saved: {path}")
+        logger.info(f"Enhanced multi-table model checkpoint saved: {path}")
 
     def _create_enhanced_model_artifact(self, path: Path):
-        """Create enhanced .nxf model artifact with relational data support."""
+        """Create enhanced .nxf model artifact with multi-table architecture support."""
         if self.best_model_state is None:
             logger.warning("No trained model to create artifact from")
             return
@@ -892,7 +925,7 @@ class Trainer:
         )
         model.load_state_dict(self.best_model_state)
         
-        # Enhanced metadata with relational and preprocessing information
+        # Enhanced metadata with multi-table architecture information
         meta = {
             'config': self.cfg.model_dump() if hasattr(self.cfg, 'model_dump') else dict(self.cfg),
             'input_dims': self.input_dims,
@@ -900,20 +933,29 @@ class Trainer:
             'best_epoch': self.best_epoch,
             'model_class': 'NexusFormer',
             'training_complete': True,
+            
+            # Phase 4 multi-table architecture indicators
             'relational_features': {
                 'relational_data_support': True,
+                'multi_table_architecture': len(self.input_dims) > 1,  # KEY INDICATOR
                 'original_datasets': len(self.cfg.datasets),
-                'flattened_features': sum(self.input_dims),
+                'input_dimensions': self.input_dims,  # Multiple dims = multiple encoders
+                'total_features': sum(self.input_dims),
                 'join_relationships': len([fk for ds in self.cfg.datasets for fk in (ds.foreign_keys or [])]),
-                'preprocessing_metadata': self.preprocessing_metadata
+                'alignment_mode': getattr(self.aligned_data['metadata'], 'alignment_mode', 'multi_table_preserved') if self.aligned_data else 'synthetic'
             },
+            
             'phase_2_features': {
                 'advanced_preprocessing': bool(self.preprocessors),
                 'relational_joins': True,
+                'per_table_preprocessing': len(self.preprocessors) > 1 if self.preprocessors else False,
                 'preprocessor_datasets': list(self.preprocessors.keys()) if self.preprocessors else []
             },
+            
             'architecture_features': {
                 'encoder_type': getattr(self.model, 'encoder_type', 'standard'),
+                'num_encoders': len(self.input_dims),  # CRITICAL: Number of separate encoders
+                'cross_context_attention': len(self.input_dims) > 1,  # Enabled when multiple encoders
                 'use_moe': self.cfg.architecture.use_moe,
                 'num_experts': self.cfg.architecture.num_experts,
                 'use_flash_attn': self.cfg.architecture.use_flash_attn,
@@ -928,16 +970,22 @@ class Trainer:
             meta['relational_schema'] = {
                 'datasets': [ds.dict() for ds in self.cfg.datasets],
                 'target_table': self.cfg.target.get('target_table'),
-                'join_order': [ds.name for ds in self.cfg.datasets]
+                'alignment_metadata': self.aligned_data['metadata'] if self.aligned_data else None
             }
+        
+        # Enhanced preprocessing metadata
+        if self.preprocessing_metadata:
+            meta['preprocessing_metadata'] = self.preprocessing_metadata
         
         # Create enhanced NexusFlowModel instance
         model_api = NexusFlowModel(model, preprocess_meta=meta)
         model_api.save(str(path))
         
-        logger.info(f"🎁 Relational model artifact created: {path}")
-        logger.info(f"   Features: relational joins, {'advanced preprocessing' if self.preprocessors else 'simple preprocessing'}")
-        logger.info(f"   Original datasets: {len(self.cfg.datasets)}, Final features: {sum(self.input_dims)}")
+        logger.info(f"🎁 Multi-table model artifact created: {path}")
+        logger.info(f"   Architecture: {len(self.input_dims)} encoders with cross-context attention")
+        logger.info(f"   Features: {'per-table preprocessing' if len(self.preprocessors) > 1 else 'single preprocessing'}")
+        logger.info(f"   Input dimensions: {self.input_dims}")
+        logger.info(f"   Original datasets: {len(self.cfg.datasets)}")
 
     def _validate_relational_data_at_inference(self, new_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """
