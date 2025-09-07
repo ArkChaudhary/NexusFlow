@@ -49,46 +49,61 @@ class NexusFlowModelArtifact:
     
     def predict(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> np.ndarray:
         """
-        Make predictions on new data.
-        
-        Args:
-            data: Input data in one of three formats:
-                1. Dict[str, DataFrame] - Multiple tables keyed by dataset name
-                2. List[DataFrame] - Multiple tables in order matching training
-                3. DataFrame - Single flattened table (backwards compatibility)
-        
-        Returns:
-            numpy array of predictions
+        Make predictions on new data with Phase 4 relational aggregation support.
         """
-        logger.info("Making predictions on new data...")
+        logger.info("Making predictions on new data with Phase 4 relational support...")
         
-        # Convert input to standardized format
-        feature_tensors = self._preprocess_input(data)
+        # Enhanced relational detection based on training logs
+        # Check multiple indicators that this model was trained with relational data
         
-        # Validate input dimensions
-        if len(feature_tensors) != len(self.input_dims):
-            raise ValueError(f"Expected {len(self.input_dims)} feature groups, got {len(feature_tensors)}")
+        # 1. Check if model has preprocessors (indicates Phase 2+ training)
+        has_preprocessors = bool(self.preprocessors)
         
-        for i, (tensor, expected_dim) in enumerate(zip(feature_tensors, self.input_dims)):
-            if tensor.size(-1) != expected_dim:
-                raise ValueError(f"Feature group {i} has {tensor.size(-1)} features, expected {expected_dim}")
+        # 2. Check metadata indicators
+        relational_features = self.meta.get('relational_features', {})
+        has_relational_support = relational_features.get('relational_data_support', False)
         
-        # Run inference
-        self.model.eval()
-        with torch.no_grad():
-            predictions = self.model(feature_tensors)
+        # 3. Check phase_2_features
+        phase_2_features = self.meta.get('phase_2_features', {})
+        has_relational_joins = phase_2_features.get('relational_joins', False)
         
-        # Convert to numpy and apply post-processing based on task type
-        predictions_np = predictions.cpu().numpy()
+        # 4. Check if config indicates multiple datasets but model expects only 1 input dimension
+        config_dict = self.meta.get('config', {})
+        datasets_config = config_dict.get('datasets', [])
+        multiple_datasets = len(datasets_config) > 1
+        single_input_dim = len(self.input_dims) == 1
         
-        # Apply task-specific post-processing
-        target_col = self.target_info.get('target_column', 'label')
-        if target_col == 'label':
-            # Classification: apply sigmoid for binary classification
-            predictions_np = 1 / (1 + np.exp(-predictions_np))  # sigmoid
+        # 5. Check for aligned_data_metadata in preprocessing_metadata
+        preprocessing_metadata = self.meta.get('preprocessing_metadata', {})
+        has_aligned_metadata = 'aligned_data_metadata' in preprocessing_metadata
         
-        logger.info(f"Generated {len(predictions_np)} predictions")
-        return predictions_np
+        # Decision logic: Use relational pipeline if ANY of these conditions are true
+        should_use_relational = (
+            # Core indicators
+            (has_relational_support and isinstance(data, dict)) or
+            (has_relational_joins and isinstance(data, dict)) or
+            (has_aligned_metadata and isinstance(data, dict) and len(data) > 1) or
+            # Strong indicators: multiple datasets in config but single input dimension
+            (multiple_datasets and single_input_dim and isinstance(data, dict) and len(data) > 1) or
+            # Preprocessor indicator: has preprocessors and multiple input tables
+            (has_preprocessors and isinstance(data, dict) and len(data) > 1)
+        )
+        
+        # Debug logging
+        logger.info(f"Relational detection analysis:")
+        logger.info(f"  - Has preprocessors: {has_preprocessors}")
+        logger.info(f"  - Has relational support: {has_relational_support}")
+        logger.info(f"  - Has relational joins: {has_relational_joins}")
+        logger.info(f"  - Multiple datasets in config: {multiple_datasets}")
+        logger.info(f"  - Single input dimension: {single_input_dim}")
+        logger.info(f"  - Has aligned metadata: {has_aligned_metadata}")
+        logger.info(f"  - Input is multi-table dict: {isinstance(data, dict) and len(data) > 1}")
+        logger.info(f"  - Decision: Use {'RELATIONAL' if should_use_relational else 'STANDARD'} pipeline")
+        
+        if should_use_relational:
+            return self._predict_relational_with_aggregation(data)
+        else:
+            return self._predict_standard(data)
     
     def _preprocess_input(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> List[torch.Tensor]:
         """
@@ -580,13 +595,308 @@ class ModelAPI:
             model.load_state_dict(ckpt['model_state'])
             return NexusFlowModelArtifact(model, meta)
 
-    def predict(self, inputs):
-        """Delegate to artifact predict method."""
-        return self.artifact.predict(inputs)
-    
-    def get_params(self):
-        """Delegate to artifact get_params method."""
-        return self.artifact.get_params()
+    def predict(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> np.ndarray:
+        """
+        Make predictions on new data with Phase 4 relational aggregation support.
+        
+        Args:
+            data: Input data in one of three formats:
+                1. Dict[str, DataFrame] - Multiple tables keyed by dataset name
+                2. List[DataFrame] - Multiple tables in order matching training
+                3. DataFrame - Single flattened table (backwards compatibility)
+        
+        Returns:
+            numpy array of predictions, properly aggregated for expanded rows
+        """
+        logger.info("Making predictions on new data with Phase 4 relational support...")
+        
+        # Check if this model has relational features from Phase 2+ training
+        has_relational_support = self.meta.get('relational_features', {}).get('relational_data_support', False)
+        phase_2_features = self.meta.get('phase_2_features', {})
+        
+        if has_relational_support and isinstance(data, dict) and phase_2_features.get('relational_joins', False):
+            # Use Phase 4 relational prediction pipeline with aggregation
+            return self._predict_relational_with_aggregation(data)
+        else:
+            # Use standard prediction pipeline
+            return self._predict_standard(data)
+
+    def _predict_relational_with_aggregation(self, data: Dict[str, pd.DataFrame]) -> np.ndarray:
+        """
+        Phase 4 relational prediction with proper aggregation.
+        Uses the same align_relational_data function as training.
+        """
+        logger.info("🔄 Applying Phase 4 relational prediction with aggregation...")
+        
+        try:
+            # Import here to avoid circular dependencies
+            from nexusflow.data.ingestion import align_relational_data
+            from nexusflow.config import ConfigModel
+            
+            # Reconstruct config from metadata
+            config_dict = self.meta.get('config', {})
+            
+            # Handle different pydantic versions
+            if hasattr(ConfigModel, 'model_validate'):
+                config = ConfigModel.model_validate(config_dict)
+            elif hasattr(ConfigModel, 'parse_obj'):
+                config = ConfigModel.parse_obj(config_dict)
+            else:
+                config = ConfigModel(**config_dict)
+            
+            # Ensure proper table naming (add .csv extension if missing)
+            data_with_csv = {}
+            for table_name, df in data.items():
+                if not table_name.endswith('.csv'):
+                    data_with_csv[f"{table_name}.csv"] = df
+                else:
+                    data_with_csv[table_name] = df
+            
+            logger.info(f"Processing tables: {list(data_with_csv.keys())}")
+            
+            # Apply the SAME relational alignment as used in training
+            logger.info("Applying relational alignment for prediction...")
+            aligned_data = align_relational_data(data_with_csv, config)
+            
+            # Apply preprocessing if available
+            if self.preprocessors:
+                aligned_data = self._apply_prediction_preprocessing(aligned_data, config)
+            
+            # Get the main expanded table
+            target_table = aligned_data['metadata']['target_table']
+            main_df = aligned_data['aligned_tables'][target_table]
+            
+            logger.info(f"Aligned data shape: {main_df.shape}")
+            logger.info(f"Aligned data columns: {list(main_df.columns)}")
+            
+            # Extract features (exclude system columns)
+            excluded_cols = {'global_id'}
+            target_col = config.target.get('target_column')
+            if target_col and target_col in main_df.columns:
+                excluded_cols.add(target_col)
+            
+            feature_cols = [col for col in main_df.columns if col not in excluded_cols]
+            features_df = main_df[feature_cols].fillna(0)
+            
+            logger.info(f"Features for prediction: {len(feature_cols)} columns, {len(features_df)} rows")
+            logger.info(f"Expected input dims: {self.input_dims}")
+            logger.info(f"Actual feature dimensions: {len(feature_cols)}")
+            
+            # Validate and adjust feature dimensions if necessary
+            expected_features = self.input_dims[0] if len(self.input_dims) > 0 else len(feature_cols)
+            
+            if len(feature_cols) != expected_features:
+                logger.warning(f"Feature dimension mismatch: expected {expected_features}, got {len(feature_cols)}")
+                logger.warning(f"Feature columns: {feature_cols[:10]}...")  # Show first 10
+                
+                # Try to match features by selecting the expected number
+                if len(feature_cols) > expected_features:
+                    logger.info(f"Truncating features from {len(feature_cols)} to {expected_features}")
+                    feature_cols = feature_cols[:expected_features]
+                    features_df = features_df[feature_cols]
+                elif len(feature_cols) < expected_features:
+                    logger.error(f"Not enough features: need {expected_features}, have {len(feature_cols)}")
+                    # Pad with zeros
+                    missing_features = expected_features - len(feature_cols)
+                    for i in range(missing_features):
+                        features_df[f'padded_feature_{i}'] = 0.0
+                    logger.info(f"Padded with {missing_features} zero features")
+            
+            # Convert to tensors
+            feature_tensor = torch.tensor(features_df.values.astype(np.float32))
+            logger.info(f"Feature tensor shape: {feature_tensor.shape}")
+            
+            # Create key features tensor (global_id + other key columns)
+            key_cols = ['global_id']
+            for col in main_df.columns:
+                if any(keyword in col.lower() for keyword in ['_id', 'key', 'pk', 'fk']) and col != 'global_id':
+                    key_cols.append(col)
+            
+            logger.info(f"Key columns: {key_cols}")
+            
+            if len(key_cols) > 1:
+                key_data = []
+                for col in key_cols:
+                    if col == 'global_id':
+                        # Convert global_id to hash for numerical processing
+                        key_data.append([hash(str(val)) % (2**31) for val in main_df[col]])
+                    else:
+                        # Handle other key columns
+                        col_data = []
+                        for val in main_df[col]:
+                            if pd.isna(val):
+                                col_data.append(0.0)
+                            elif isinstance(val, (int, float)):
+                                col_data.append(float(val))
+                            else:
+                                col_data.append(float(hash(str(val)) % (2**31)))
+                        key_data.append(col_data)
+                
+                key_tensor = torch.tensor(np.array(key_data).T, dtype=torch.float32)
+            else:
+                # Only global_id
+                key_data = [hash(str(val)) % (2**31) for val in main_df['global_id']]
+                key_tensor = torch.tensor(key_data, dtype=torch.float32).unsqueeze(1)
+            
+            logger.info(f"Key tensor shape: {key_tensor.shape}")
+            
+            # Run model prediction
+            self.model.eval()
+            with torch.no_grad():
+                predictions = self.model([feature_tensor], key_features=key_tensor)
+            
+            # Convert to numpy
+            predictions_np = predictions.cpu().numpy()
+            logger.info(f"Raw predictions shape: {predictions_np.shape}")
+            
+            # Apply task-specific post-processing
+            target_col = self.target_info.get('target_column', 'label')
+            if target_col == 'label':
+                # Classification: apply sigmoid for binary classification
+                predictions_np = 1 / (1 + np.exp(-predictions_np))  # sigmoid
+            
+            # PHASE 4 AGGREGATION: Group predictions by original primary key
+            logger.info("🎯 Performing Phase 4 prediction aggregation...")
+            
+            if 'key_map' in aligned_data and len(aligned_data['key_map']) > 0:
+                key_map_df = aligned_data['key_map']
+                logger.info(f"Key map shape: {key_map_df.shape}")
+                logger.info(f"Key map columns: {list(key_map_df.columns)}")
+                
+                # Create aggregation mapping
+                aggregation_df = pd.DataFrame({
+                    'global_id': main_df['global_id'].values,
+                    'prediction': predictions_np
+                })
+                
+                logger.info(f"Aggregation df shape: {aggregation_df.shape}")
+                
+                # Merge with key_map to get original keys
+                merged_df = aggregation_df.merge(key_map_df, on='global_id', how='left')
+                logger.info(f"Merged df shape: {merged_df.shape}")
+                logger.info(f"Merged df columns: {list(merged_df.columns)}")
+                
+                # Find the primary key column for the target table
+                target_dataset_config = None
+                target_table_clean = target_table.replace('.csv', '')
+                
+                for ds_config in config.datasets:
+                    if ds_config.name == target_table_clean:
+                        target_dataset_config = ds_config
+                        break
+                
+                if target_dataset_config and target_dataset_config.primary_key:
+                    primary_key = target_dataset_config.primary_key
+                    if isinstance(primary_key, list):
+                        primary_key_name = primary_key[0]
+                    else:
+                        primary_key_name = primary_key
+                    
+                    # Look for the primary key column in merged_df
+                    possible_key_cols = [
+                        f"{target_table}_{primary_key_name}",
+                        f"{target_table_clean}_{primary_key_name}",
+                        primary_key_name,
+                        f"users.csv_{primary_key_name}",  # specific for this case
+                        f"users_{primary_key_name}"
+                    ]
+                    
+                    available_key_cols = [col for col in possible_key_cols if col in merged_df.columns]
+                    
+                    logger.info(f"Looking for primary key: {primary_key_name}")
+                    logger.info(f"Possible columns: {possible_key_cols}")
+                    logger.info(f"Available columns: {available_key_cols}")
+                    
+                    if available_key_cols:
+                        key_col = available_key_cols[0]
+                        logger.info(f"Aggregating by: {key_col}")
+                        
+                        # Group by original primary key and aggregate (mean strategy)
+                        aggregated = merged_df.groupby(key_col)['prediction'].mean().reset_index()
+                        final_predictions = aggregated['prediction'].values
+                        
+                        logger.info(f"✅ Aggregated {len(predictions_np)} expanded predictions to {len(final_predictions)} final predictions")
+                        return final_predictions
+                    else:
+                        logger.warning(f"Primary key column not found. Available columns: {list(merged_df.columns)}")
+                else:
+                    logger.warning("No primary key configuration found for aggregation")
+            
+            # Fallback: return raw predictions if aggregation fails
+            logger.warning("⚠️ Could not perform prediction aggregation, returning raw predictions")
+            return predictions_np
+            
+        except Exception as e:
+            logger.error(f"Relational prediction failed: {e}")
+            logger.exception("Full error details:")
+            logger.info("Falling back to standard prediction pipeline")
+            return self._predict_standard(data)
+
+    def _predict_standard(self, data: Union[Dict[str, pd.DataFrame], List[pd.DataFrame], pd.DataFrame]) -> np.ndarray:
+        """Standard prediction pipeline (original logic)."""
+        # Convert input to standardized format
+        feature_tensors = self._preprocess_input(data)
+        
+        # Validate input dimensions
+        if len(feature_tensors) != len(self.input_dims):
+            raise ValueError(f"Expected {len(self.input_dims)} feature groups, got {len(feature_tensors)}")
+        
+        for i, (tensor, expected_dim) in enumerate(zip(feature_tensors, self.input_dims)):
+            if tensor.size(-1) != expected_dim:
+                raise ValueError(f"Feature group {i} has {tensor.size(-1)} features, expected {expected_dim}")
+        
+        # Run inference
+        self.model.eval()
+        with torch.no_grad():
+            predictions = self.model(feature_tensors)
+        
+        # Convert to numpy and apply post-processing based on task type
+        predictions_np = predictions.cpu().numpy()
+        
+        # Apply task-specific post-processing
+        target_col = self.target_info.get('target_column', 'label')
+        if target_col == 'label':
+            # Classification: apply sigmoid for binary classification
+            predictions_np = 1 / (1 + np.exp(-predictions_np))  # sigmoid
+        
+        logger.info(f"Generated {len(predictions_np)} predictions")
+        return predictions_np
+
+    def _apply_prediction_preprocessing(self, aligned_data, config):
+        """Apply preprocessing to aligned data for prediction."""
+        target_table = aligned_data['metadata']['target_table']
+        
+        if target_table in self.preprocessors:
+            logger.info(f"Applying trained preprocessor to {target_table}")
+            
+            main_df = aligned_data['aligned_tables'][target_table].copy()
+            preprocessor = self.preprocessors[target_table]
+            
+            # Exclude system columns
+            excluded_cols = {'global_id'}
+            target_col = config.target.get('target_column')
+            if target_col and target_col in main_df.columns:
+                excluded_cols.add(target_col)
+            
+            feature_df = main_df.drop(columns=excluded_cols, errors='ignore')
+            
+            # Transform features
+            try:
+                processed_features = preprocessor.transform(feature_df)
+                final_cols = preprocessor.categorical_columns + preprocessor.numerical_columns
+                processed_df = processed_features[final_cols].copy()
+                
+                # Add back excluded columns
+                for col in excluded_cols:
+                    if col in main_df.columns:
+                        processed_df[col] = main_df[col].values
+                
+                aligned_data['aligned_tables'][target_table] = processed_df
+                
+            except Exception as e:
+                logger.warning(f"Preprocessing failed during prediction: {e}")
+        
+        return aligned_data
 
 def extract_pytorch_model(obj):
     """

@@ -553,8 +553,8 @@ class NexusFormer(nn.Module):
         logger.info(f"Enhanced NexusFormer initialized: {self.num_encoders} {encoder_type} encoders, "
                    f"{refinement_iterations} iterations, MoE={use_moe}, FlashAttn={use_flash_attn}")
     
-    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
-        """Enhanced forward pass with adaptive fusion."""
+    def forward(self, inputs: List[torch.Tensor], key_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Enhanced forward pass with adaptive fusion and key features support."""
         if len(inputs) != len(self.encoders):
             raise ValueError(f"Expected {len(self.encoders)} inputs, got {len(inputs)}")
         
@@ -566,6 +566,12 @@ class NexusFormer(nn.Module):
                 raise ValueError(f"Input {idx} has shape {tuple(x.shape)}, expected [batch, {expected_dim}]")
             if x.size(0) != batch_size:
                 raise ValueError(f"Batch size mismatch at input {idx}: {x.size(0)} vs {batch_size}")
+        
+        # Store key features for potential aggregation needs (Phase 4 support)
+        if key_features is not None:
+            self._current_key_features = key_features
+            # For now, we don't use key_features in the forward pass
+            # but store them for potential future use in prediction aggregation
         
         # Initial encoding phase
         representations = []

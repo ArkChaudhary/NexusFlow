@@ -614,8 +614,14 @@ class Trainer:
                     *features, targets = batch
                     key_features = None  # Synthetic data doesn't have key features yet
                 else:
-                    # NEW: Unpack three-tensor structure
-                    features, key_features, targets = batch
+                    # Handle both two-tensor and three-tensor structures
+                    if len(batch) == 3:
+                        # NEW: Unpack three-tensor structure (features, key_features, targets)
+                        features, key_features, targets = batch
+                    else:
+                        # Fallback: two-tensor structure (features, targets)
+                        features, targets = batch
+                        key_features = None
                 
                 features = [f.to(self.device) for f in features]
                 if key_features is not None:
@@ -712,7 +718,13 @@ class Trainer:
                     *features, targets = batch
                     key_features = None
                 else:
-                    features, key_features, targets = batch
+                    if len(batch) == 3:
+                        # Three-tensor structure: features, key_features, targets
+                        features, key_features, targets = batch
+                    else:
+                        # Two-tensor structure: features, targets (fallback)
+                        features, targets = batch
+                        key_features = None
                 
                 features = [f.to(self.device) for f in features]
                 if key_features is not None:
@@ -793,21 +805,45 @@ class Trainer:
             preprocessor.save(str(preprocessor_path))
             logger.info(f"💾 Saved preprocessor: {preprocessor_path}")
         
-        # Save preprocessing metadata
+        # Save preprocessing metadata (JSON-safe version)
         if self.preprocessing_metadata:
             metadata_path = preprocess_dir / "preprocessing_metadata.json"
             with open(metadata_path, 'w') as f:
-                # Convert to JSON-serializable format
+                # Convert to JSON-serializable format with better filtering
                 serializable_metadata = {}
                 for key, value in self.preprocessing_metadata.items():
-                    if key == 'preprocessor_info':
-                        # Skip preprocessor objects, just save the structure info
-                        serializable_metadata[key] = {
-                            dataset: {k: v for k, v in info.items() if k != 'preprocessor'}
-                            for dataset, info in value.items()
-                        }
-                    else:
-                        serializable_metadata[key] = value
+                    try:
+                        if key == 'preprocessor_info':
+                            # Convert preprocessor_info to safe format
+                            safe_preprocessor_info = {}
+                            if isinstance(value, dict):
+                                for dataset, info in value.items():
+                                    safe_info = {}
+                                    if isinstance(info, dict):
+                                        for k, v in info.items():
+                                            if k != 'preprocessor' and _is_json_serializable(v):
+                                                safe_info[k] = v
+                                    safe_preprocessor_info[dataset] = safe_info
+                            serializable_metadata[key] = safe_preprocessor_info
+                        elif key == 'aligned_data_metadata':
+                            # Handle AlignedData metadata specially
+                            safe_aligned_metadata = {}
+                            if isinstance(value, dict):
+                                for k, v in value.items():
+                                    if _is_json_serializable(v):
+                                        safe_aligned_metadata[k] = v
+                                    else:
+                                        # Convert non-serializable to string representation
+                                        safe_aligned_metadata[k] = str(v)
+                            serializable_metadata[key] = safe_aligned_metadata
+                        elif _is_json_serializable(value):
+                            serializable_metadata[key] = value
+                        else:
+                            # Convert non-serializable objects to string
+                            serializable_metadata[key] = str(value)
+                    except Exception as e:
+                        logger.warning(f"Skipping metadata key '{key}': {e}")
+                        serializable_metadata[key] = f"<not serializable: {type(value).__name__}>"
                 
                 json.dump(serializable_metadata, f, indent=2)
             
@@ -1015,3 +1051,11 @@ class Trainer:
                 logger.info(f"   {key}: {value}")
         
         return metrics
+    
+def _is_json_serializable(obj):
+    """Check if an object is JSON serializable."""
+    try:
+        json.dumps(obj)
+        return True
+    except (TypeError, OverflowError):
+        return False
