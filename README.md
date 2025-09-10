@@ -112,9 +112,8 @@ pruned_model = optimize_model(model, method='pruning', amount=0.3)
 
 ## Quick Start
 
-### Set up in Google Colab
-
-[Google Colab Nexusflow Demo](https://colab.research.google.com/github/ArkChaudhary/NexusFlow/blob/main/demo.ipynb)
+### 🟢 Easiest: Run on Google Colab  
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ArkChaudhary/NexusFlow/blob/main/demo.ipynb)
 
 ### Installation & Setup
 
@@ -371,17 +370,14 @@ mlops:
 ### Customer Analytics & Churn Prediction
 - **Multiple data sources**: Demographics, transaction history, support interactions
 - **Complex relationships**: Customer lifetime value influenced by transaction patterns and support quality
-- **Business impact**: 89.1% accuracy vs 76.8% with traditional methods
 
 ### E-Commerce Recommendation Systems  
 - **Rich context**: User profiles, purchase history, browsing behavior, reviews
 - **Deep personalization**: Cross-table attention discovers nuanced preferences
-- **Revenue impact**: 84.3% recommendation accuracy, significant conversion improvement
 
 ### Financial Risk Assessment
 - **Comprehensive view**: Account data, transaction patterns, credit history, external factors
 - **Regulatory compliance**: Interpretable feature importance through TabNet
-- **Risk reduction**: 86.7% accuracy in fraud detection
 
 ### Healthcare Analytics
 - **Patient records**: Demographics, medical history, treatment outcomes, lab results
