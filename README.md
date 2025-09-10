@@ -112,7 +112,9 @@ pruned_model = optimize_model(model, method='pruning', amount=0.3)
 
 ## Quick Start
 
-[Try it in Google Colab](https://colab.research.google.com/github/ArkChaudhary/NexusFlow/blob/main/demo.ipynb)
+### Set up in Google Colab
+
+[Google Colab Nexusflow Demo](https://colab.research.google.com/github/ArkChaudhary/NexusFlow/blob/main/demo.ipynb)
 
 ### Installation & Setup
 
