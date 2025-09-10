@@ -30,7 +30,7 @@ model = NexusFormer(collaborative_intelligence=True)
 accuracy = 0.89  # Superior performance through multi-agent collaboration
 ```
 
-## 🧬 The AlphaFold Connection: From Proteins to Data Tables
+## The AlphaFold Connection: From Proteins to Data Tables
 
 NexusFlow adapts the **Evoformer architecture** from DeepMind's AlphaFold 2, which solved protein folding by understanding complex relationships between amino acid residues. We apply this same breakthrough approach to tabular data relationships.
 
@@ -112,7 +112,7 @@ pruned_model = optimize_model(model, method='pruning', amount=0.3)
 
 ## Quick Start
 
-[![Try it in Google Colab](https://colab.research.google.com/github/ArkChaudhary/NexusFlow/blob/main/demo.ipynb)]
+[Try it in Google Colab](https://colab.research.google.com/github/ArkChaudhary/NexusFlow/blob/main/demo.ipynb)
 
 ### Installation & Setup
 
